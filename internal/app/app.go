@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"image/color"
@@ -76,23 +77,25 @@ type lineSegment struct {
 }
 
 type lineLayout struct {
-	block    int
-	text     []byte
-	segments []lineSegment
-	docX     int
-	docY     int
-	viewX    int
-	y        int
-	baseline int
-	height   int
-	ascent   int
-	width    int
+	block     int
+	startByte int
+	text      []byte
+	segments  []lineSegment
+	docX      int
+	docY      int
+	viewX     int
+	y         int
+	baseline  int
+	height    int
+	ascent    int
+	width     int
 }
 
 type fontKey struct {
 	size   int
 	bold   bool
 	italic bool
+	scale  int
 }
 
 type fontBank struct {
@@ -177,6 +180,16 @@ type App struct {
 	compressionEnabled    bool
 	encryptionPassword    string
 
+	showPasswordPrompt    bool
+	passwordPromptRect    rect
+	passwordInputRect     rect
+	passwordSubmitRect    rect
+	passwordCancelRect    rect
+	passwordPromptPath    string
+	passwordPromptInput   string
+	passwordPromptError   string
+	passwordPromptFocused bool
+
 	scrollX float64
 	scrollY float64
 	maxX    float64
@@ -226,8 +239,19 @@ func (a *App) Update() error {
 	ctrl := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
 	shift := ebiten.IsKeyPressed(ebiten.KeyShift)
 	alt := ebiten.IsKeyPressed(ebiten.KeyAlt)
+	winW, winH := ebiten.WindowSize()
+	if a.showEncryption {
+		a.layoutEncryptionPanelBounds(winW, winH)
+	}
+	if a.showPasswordPrompt {
+		a.layoutPasswordPromptBounds(winW, winH)
+	}
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+		if a.showPasswordPrompt {
+			a.closePasswordPrompt()
+			return nil
+		}
 		if a.fontInputActive {
 			a.fontInputActive = false
 			a.fontInputBuffer = ""
@@ -284,6 +308,10 @@ func (a *App) Update() error {
 
 	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
 		x, y := ebiten.CursorPosition()
+		if a.showPasswordPrompt {
+			a.handlePasswordPromptClick(x, y)
+			return nil
+		}
 		if id, ok := a.actionAt(x, y); ok {
 			a.invokeAction(id)
 			return nil
@@ -324,6 +352,11 @@ func (a *App) Update() error {
 	}
 	if inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft) {
 		a.dragSelecting = false
+	}
+
+	if a.showPasswordPrompt {
+		a.clampScroll()
+		return nil
 	}
 
 	didSnapshot := false
@@ -423,6 +456,18 @@ func (a *App) Update() error {
 		recordMutation()
 		a.state.CycleColor()
 	}
+	if ctrl && shift && inpututil.IsKeyJustPressed(ebiten.KeyH) {
+		recordMutation()
+		a.state.ToggleHighlight()
+	}
+	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+		recordMutation()
+		a.state.DeleteWordBackward()
+	}
+	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyDelete) {
+		recordMutation()
+		a.state.DeleteWordForward()
+	}
 
 	moveWithSelection := func(move func()) {
 		if shift {
@@ -498,7 +543,7 @@ func (a *App) Update() error {
 		}
 	}
 
-	if ctrl || a.showEncryption {
+	if ctrl || a.showEncryption || a.showPasswordPrompt {
 		a.clampScroll()
 		a.ensureCaretVisible()
 		return nil
@@ -537,6 +582,44 @@ func (a *App) Update() error {
 }
 
 func (a *App) handleOverlayTextInput(ctrl bool) bool {
+	if a.showPasswordPrompt {
+		consumed := false
+		if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
+			if len(a.passwordPromptInput) > 0 {
+				_, size := utf8.DecodeLastRuneInString(a.passwordPromptInput)
+				if size <= 0 {
+					size = 1
+				}
+				a.passwordPromptInput = a.passwordPromptInput[:len(a.passwordPromptInput)-size]
+			}
+			consumed = true
+		}
+		if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyV) {
+			if clip, err := clipboard.ReadAll(); err == nil && clip != "" {
+				a.passwordPromptInput += clip
+				if len(a.passwordPromptInput) > 128 {
+					a.passwordPromptInput = a.passwordPromptInput[:128]
+				}
+			}
+			consumed = true
+		}
+		if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyKPEnter) {
+			a.submitPasswordPrompt()
+			consumed = true
+		}
+		for _, r := range ebiten.AppendInputChars(nil) {
+			if r < 0x20 || r == 0x7F || !utf8.ValidRune(r) {
+				continue
+			}
+			a.passwordPromptInput += string(r)
+			if len(a.passwordPromptInput) > 128 {
+				a.passwordPromptInput = a.passwordPromptInput[:128]
+			}
+			consumed = true
+		}
+		return consumed
+	}
+
 	if a.fontInputActive {
 		consumed := false
 		if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
@@ -648,6 +731,65 @@ func (a *App) handleEncryptionClick(x, y int) bool {
 	}
 	a.encryptionInputActive = false
 	return true
+}
+
+func (a *App) handlePasswordPromptClick(x, y int) {
+	if !a.showPasswordPrompt {
+		return
+	}
+	if !a.passwordPromptRect.contains(x, y) {
+		a.closePasswordPrompt()
+		return
+	}
+	if a.passwordInputRect.contains(x, y) {
+		a.passwordPromptFocused = true
+		return
+	}
+	a.passwordPromptFocused = false
+	if a.passwordSubmitRect.contains(x, y) {
+		a.submitPasswordPrompt()
+		return
+	}
+	if a.passwordCancelRect.contains(x, y) {
+		a.closePasswordPrompt()
+		return
+	}
+}
+
+func (a *App) submitPasswordPrompt() {
+	path := strings.TrimSpace(a.passwordPromptPath)
+	if path == "" {
+		a.closePasswordPrompt()
+		return
+	}
+	doc, err := sqdoc.LoadWithOptions(filepath.Clean(path), sqdoc.LoadOptions{Password: a.passwordPromptInput})
+	if err != nil {
+		if errors.Is(err, sqdoc.ErrPasswordRequired) || errors.Is(err, sqdoc.ErrInvalidPassword) {
+			a.passwordPromptError = "Incorrect password. Try again."
+			return
+		}
+		a.status = "Open failed: " + err.Error()
+		a.closePasswordPrompt()
+		return
+	}
+
+	a.state = editor.NewState(doc)
+	a.filePath = path
+	a.status = "Opened " + filepath.Base(path)
+	a.scrollX, a.scrollY = 0, 0
+	a.maxX, a.maxY = 0, 0
+	a.undoHistory = a.undoHistory[:0]
+	a.redoHistory = a.redoHistory[:0]
+	a.encryptionPassword = a.passwordPromptInput
+	a.closePasswordPrompt()
+}
+
+func (a *App) closePasswordPrompt() {
+	a.showPasswordPrompt = false
+	a.passwordPromptFocused = false
+	a.passwordPromptPath = ""
+	a.passwordPromptInput = ""
+	a.passwordPromptError = ""
 }
 
 func (a *App) handleToolbarClick(x, y int) bool {
@@ -770,6 +912,14 @@ func (a *App) invokeAction(id string) {
 		} else {
 			a.status = "Underline off"
 		}
+	case "highlight":
+		a.pushUndoSnapshot()
+		a.state.ToggleHighlight()
+		if a.state.CurrentStyleAttr().Highlight {
+			a.status = "Highlight on"
+		} else {
+			a.status = "Highlight off"
+		}
 	case "font_down":
 		a.pushUndoSnapshot()
 		a.state.DecreaseFontSize()
@@ -794,10 +944,10 @@ func (a *App) Draw(screen *ebiten.Image) {
 	}
 
 	layout := ui.DrawShell(a.frameBuffer, a.state, a.theme, a.uiScales[a.uiScaleIdx])
-	menuFace := a.uiFace(11, false)
-	toolbarFace := a.uiFace(11, false)
-	statusFace := a.uiFace(10, false)
-	panelFace := a.uiFace(9, false)
+	menuFace := a.uiFace(11, false, false)
+	toolbarFace := a.uiFace(11, false, false)
+	statusFace := a.uiFace(10, false, false)
+	panelFace := a.uiFace(9, false, false)
 
 	a.layoutTopActions(menuFace, layout)
 	a.layoutToolbarControls(toolbarFace, layout)
@@ -808,7 +958,12 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.drawDocumentSelectionAndCaret()
 	a.drawScrollbars()
 	a.drawDataMapPanel()
-	a.drawEncryptionPanel(w, h)
+	if a.showEncryption {
+		a.layoutEncryptionPanelBounds(w, h)
+	}
+	if a.showPasswordPrompt {
+		a.layoutPasswordPromptBounds(w, h)
+	}
 
 	a.canvas.WritePixels(a.frameBuffer.Pixels)
 	screen.DrawImage(a.canvas, nil)
@@ -817,7 +972,6 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.drawToolbarLabels(screen, toolbarFace)
 	a.drawDocumentText(screen)
 	a.drawDataMapLabels(screen, panelFace)
-	a.drawEncryptionLabels(screen, toolbarFace)
 
 	name := a.filePath
 	if name == "" {
@@ -832,10 +986,15 @@ func (a *App) Draw(screen *ebiten.Image) {
 		scrollYPct = (a.scrollY / a.maxY) * 100
 	}
 	attr := a.state.CurrentStyleAttr()
-	statusLeft := fmt.Sprintf("Block %d/%d | Caret %d | Font %dpt", a.state.CurrentBlock+1, a.state.BlockCount(), a.state.CaretByte, attr.FontSizePt)
+	statusLeft := fmt.Sprintf("[ Block %d/%d ] [ Caret %d ] [ Font %dpt ]", a.state.CurrentBlock+1, a.state.BlockCount(), a.state.CaretByte, attr.FontSizePt)
 	statusRight := fmt.Sprintf("%s | Scroll X %.0f%% Y %.0f%% | %s", name, scrollXPct, scrollYPct, a.status)
 	text.Draw(screen, statusLeft, statusFace, 12, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
 	text.Draw(screen, statusRight, statusFace, 320, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
+
+	a.drawColorPickerOverlay(screen)
+	a.drawEncryptionPanel(screen, w, h)
+	a.drawEncryptionLabels(screen, toolbarFace)
+	a.drawPasswordPrompt(screen, w, h)
 
 	if a.showHelp {
 		a.drawHelpOverlay(screen, toolbarFace)
@@ -843,12 +1002,12 @@ func (a *App) Draw(screen *ebiten.Image) {
 }
 
 func (a *App) layoutContentRects(layout ui.Layout) {
-	textBox := rect{x: layout.ContentX + 10, y: layout.ContentY + 30, w: layout.ContentW - 20, h: layout.ContentH - 34}
-	if textBox.w < 280 {
-		textBox.w = 280
+	textBox := rect{x: layout.ContentX + 6, y: layout.ContentY + 24, w: layout.ContentW - 12, h: layout.ContentH - 28}
+	if textBox.w < 360 {
+		textBox.w = 360
 	}
-	if textBox.h < 160 {
-		textBox.h = 160
+	if textBox.h < 220 {
+		textBox.h = 220
 	}
 	a.dataMapRect = rect{}
 	if a.showDataMap {
@@ -862,11 +1021,11 @@ func (a *App) layoutContentRects(layout ui.Layout) {
 		a.dataMapRect = rect{x: textBox.x + textBox.w - panelW, y: textBox.y, w: panelW, h: textBox.h}
 		textBox.w -= panelW + 12
 	}
-	if textBox.w < 220 {
-		textBox.w = 220
+	if textBox.w < 260 {
+		textBox.w = 260
 	}
-	if textBox.h < 140 {
-		textBox.h = 140
+	if textBox.h < 180 {
+		textBox.h = 180
 	}
 	a.contentRect = textBox
 }
@@ -916,11 +1075,6 @@ func (a *App) drawToolbarLabels(screen *ebiten.Image, face font.Face) {
 		baseline := btn.r.y + (btn.r.h+textHeight)/2 - descent
 		text.Draw(screen, label, face, x, baseline, labelColor)
 	}
-
-	if a.showColorPicker {
-		captionFace := a.uiFace(9, false)
-		text.Draw(screen, "Color", captionFace, a.colorPopupRect.x+8, a.colorPopupRect.y+14, color.RGBA{R: 44, G: 58, B: 82, A: 255})
-	}
 }
 
 func (a *App) drawDataMapLabels(screen *ebiten.Image, face font.Face) {
@@ -936,8 +1090,8 @@ func (a *App) drawEncryptionLabels(screen *ebiten.Image, face font.Face) {
 	if !a.showEncryption {
 		return
 	}
-	titleFace := a.uiFace(12, true)
-	labelFace := a.uiFace(10, false)
+	titleFace := a.uiFace(12, true, false)
+	labelFace := a.uiFace(10, false, false)
 	text.Draw(screen, "Encryption View", titleFace, a.encryptionPanel.x+16, a.encryptionPanel.y+24, color.RGBA{R: 24, G: 38, B: 56, A: 255})
 	text.Draw(screen, "Close", face, a.encryptionCloseRect.x+18, a.encryptionCloseRect.y+a.encryptionCloseRect.h-8, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "Compression (zlib)", labelFace, a.encryptionCompRect.x+28, a.encryptionCompRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
@@ -958,10 +1112,7 @@ func (a *App) drawEncryptionLabels(screen *ebiten.Image, face font.Face) {
 	text.Draw(screen, hint, labelFace, a.encryptionPanel.x+16, a.encryptionPanel.y+a.encryptionPanel.h-12, color.RGBA{R: 74, G: 88, B: 112, A: 255})
 }
 
-func (a *App) drawEncryptionPanel(w, h int) {
-	if !a.showEncryption {
-		return
-	}
+func (a *App) layoutEncryptionPanelBounds(w, h int) {
 	panelW := int(520 * a.uiScales[a.uiScaleIdx])
 	panelH := int(240 * a.uiScales[a.uiScaleIdx])
 	if panelW > w-40 {
@@ -977,33 +1128,53 @@ func (a *App) drawEncryptionPanel(w, h int) {
 	a.encryptionCompRect = rect{x: px + 20, y: py + 58, w: 18, h: 18}
 	a.encryptionEncRect = rect{x: px + 20, y: py + 92, w: 18, h: 18}
 	a.encryptionPassRect = rect{x: px + 20, y: py + 136, w: panelW - 40, h: 30}
+}
 
-	a.frameBuffer.FillRect(px, py, panelW, panelH, color.RGBA{R: 248, G: 250, B: 253, A: 255})
-	a.frameBuffer.StrokeRect(px, py, panelW, panelH, 1, color.RGBA{R: 160, G: 176, B: 198, A: 255})
+func (a *App) drawEncryptionPanel(screen *ebiten.Image, w, h int) {
+	if !a.showEncryption {
+		return
+	}
+	a.layoutEncryptionPanelBounds(w, h)
+	px, py, panelW, panelH := a.encryptionPanel.x, a.encryptionPanel.y, a.encryptionPanel.w, a.encryptionPanel.h
 
-	a.frameBuffer.FillRect(a.encryptionCloseRect.x, a.encryptionCloseRect.y, a.encryptionCloseRect.w, a.encryptionCloseRect.h, color.RGBA{R: 237, G: 242, B: 248, A: 255})
-	a.frameBuffer.StrokeRect(a.encryptionCloseRect.x, a.encryptionCloseRect.y, a.encryptionCloseRect.w, a.encryptionCloseRect.h, 1, color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	a.drawFilledRectOnScreen(screen, px, py, panelW, panelH, color.RGBA{R: 248, G: 250, B: 253, A: 255})
+	ebitenutil.DrawLine(screen, float64(px), float64(py), float64(px+panelW), float64(py), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+	ebitenutil.DrawLine(screen, float64(px), float64(py+panelH), float64(px+panelW), float64(py+panelH), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+	ebitenutil.DrawLine(screen, float64(px), float64(py), float64(px), float64(py+panelH), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+	ebitenutil.DrawLine(screen, float64(px+panelW), float64(py), float64(px+panelW), float64(py+panelH), color.RGBA{R: 160, G: 176, B: 198, A: 255})
 
-	a.drawCheckbox(a.encryptionCompRect, a.compressionEnabled)
-	a.drawCheckbox(a.encryptionEncRect, a.encryptionEnabled)
+	a.drawFilledRectOnScreen(screen, a.encryptionCloseRect.x, a.encryptionCloseRect.y, a.encryptionCloseRect.w, a.encryptionCloseRect.h, color.RGBA{R: 237, G: 242, B: 248, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionCloseRect.x), float64(a.encryptionCloseRect.y), float64(a.encryptionCloseRect.x+a.encryptionCloseRect.w), float64(a.encryptionCloseRect.y), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionCloseRect.x), float64(a.encryptionCloseRect.y+a.encryptionCloseRect.h), float64(a.encryptionCloseRect.x+a.encryptionCloseRect.w), float64(a.encryptionCloseRect.y+a.encryptionCloseRect.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionCloseRect.x), float64(a.encryptionCloseRect.y), float64(a.encryptionCloseRect.x), float64(a.encryptionCloseRect.y+a.encryptionCloseRect.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionCloseRect.x+a.encryptionCloseRect.w), float64(a.encryptionCloseRect.y), float64(a.encryptionCloseRect.x+a.encryptionCloseRect.w), float64(a.encryptionCloseRect.y+a.encryptionCloseRect.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+
+	a.drawCheckbox(screen, a.encryptionCompRect, a.compressionEnabled)
+	a.drawCheckbox(screen, a.encryptionEncRect, a.encryptionEnabled)
 
 	passBg := color.RGBA{R: 255, G: 255, B: 255, A: 255}
 	if a.encryptionInputActive {
 		passBg = color.RGBA{R: 244, G: 249, B: 255, A: 255}
 	}
-	a.frameBuffer.FillRect(a.encryptionPassRect.x, a.encryptionPassRect.y, a.encryptionPassRect.w, a.encryptionPassRect.h, passBg)
+	a.drawFilledRectOnScreen(screen, a.encryptionPassRect.x, a.encryptionPassRect.y, a.encryptionPassRect.w, a.encryptionPassRect.h, passBg)
 	border := color.RGBA{R: 170, G: 184, B: 202, A: 255}
 	if a.encryptionInputActive {
 		border = color.RGBA{R: 77, G: 134, B: 205, A: 255}
 	}
-	a.frameBuffer.StrokeRect(a.encryptionPassRect.x, a.encryptionPassRect.y, a.encryptionPassRect.w, a.encryptionPassRect.h, 1, border)
+	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y), float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y), border)
+	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), border)
+	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y), float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), border)
+	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y), float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), border)
 }
 
-func (a *App) drawCheckbox(r rect, checked bool) {
-	a.frameBuffer.FillRect(r.x, r.y, r.w, r.h, color.RGBA{R: 255, G: 255, B: 255, A: 255})
-	a.frameBuffer.StrokeRect(r.x, r.y, r.w, r.h, 1, color.RGBA{R: 130, G: 148, B: 176, A: 255})
+func (a *App) drawCheckbox(screen *ebiten.Image, r rect, checked bool) {
+	a.drawFilledRectOnScreen(screen, r.x, r.y, r.w, r.h, color.RGBA{R: 255, G: 255, B: 255, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x+r.w), float64(r.y), color.RGBA{R: 130, G: 148, B: 176, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y+r.h), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 130, G: 148, B: 176, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 130, G: 148, B: 176, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 130, G: 148, B: 176, A: 255})
 	if checked {
-		a.frameBuffer.FillRect(r.x+4, r.y+4, r.w-8, r.h-8, color.RGBA{R: 46, G: 102, B: 182, A: 255})
+		a.drawFilledRectOnScreen(screen, r.x+4, r.y+4, r.w-8, r.h-8, color.RGBA{R: 46, G: 102, B: 182, A: 255})
 	}
 }
 
@@ -1173,6 +1344,7 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 	addBtn("bold", "Bold", 58, attr.Bold)
 	addBtn("italic", "Italic", 58, attr.Italic)
 	addBtn("underline", "Underline", 78, attr.Underline)
+	addBtn("highlight", "Highlight", 82, attr.Highlight)
 	x += 4
 
 	addBtn("font_down", "-", 28, false)
@@ -1191,8 +1363,6 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 		px := colorRect.x
 		py := colorRect.y + colorRect.h + 4
 		a.colorPopupRect = rect{x: px, y: py, w: popupW, h: popupH}
-		a.frameBuffer.FillRect(px, py, popupW, popupH, color.RGBA{R: 249, G: 251, B: 254, A: 255})
-		a.frameBuffer.StrokeRect(px, py, popupW, popupH, 1, color.RGBA{R: 178, G: 191, B: 210, A: 255})
 		cols := 6
 		sx := px + 8
 		sy := py + 20
@@ -1202,12 +1372,6 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 			cx := sx + (i%cols)*(size+gap)
 			cy := sy + (i/cols)*(size+gap)
 			r := rect{x: cx, y: cy, w: size, h: size}
-			a.frameBuffer.FillRect(r.x, r.y, r.w, r.h, rgbaFromUint32(c))
-			border := color.RGBA{R: 118, G: 132, B: 152, A: 255}
-			if c == attr.ColorRGBA {
-				border = color.RGBA{R: 35, G: 90, B: 170, A: 255}
-			}
-			a.frameBuffer.StrokeRect(r.x, r.y, r.w, r.h, 1, border)
 			a.colorSwatches = append(a.colorSwatches, colorSwatch{value: c, r: r})
 		}
 	}
@@ -1229,15 +1393,21 @@ func (a *App) measureString(face font.Face, s string) int {
 }
 
 // uiFace returns a cached face for the UI, scaling by current UI scale.
-func (a *App) uiFace(size int, bold bool) font.Face {
-	key := fontKey{size: size, bold: bold, italic: false}
+func (a *App) uiFace(size int, bold, italic bool) font.Face {
+	scaleKey := int(math.Round(float64(a.uiScales[a.uiScaleIdx] * 1000)))
+	key := fontKey{size: size, bold: bold, italic: italic, scale: scaleKey}
 	if f, ok := a.fonts.cache[key]; ok {
 		return f
 	}
 	var base *opentype.Font
-	if bold {
+	switch {
+	case bold && italic:
+		base = a.fonts.boldItalic
+	case bold:
 		base = a.fonts.bold
-	} else {
+	case italic:
+		base = a.fonts.italic
+	default:
 		base = a.fonts.regular
 	}
 	if base == nil {
@@ -1257,150 +1427,466 @@ func (a *App) layoutDocumentLines() {
 	if a.state == nil || a.contentRect.w <= 0 || a.contentRect.h <= 0 {
 		return
 	}
-	y := a.contentRect.y + 8
-	padX := a.contentRect.x + 8
-	for bi := 0; bi < a.state.BlockCount(); bi++ {
-		txt := a.state.AllBlockTexts()[bi]
-		lines := strings.Split(txt, "\n")
-		byteAcc := 0
-		for _, l := range lines {
-			ll := lineLayout{block: bi, text: []byte(l), viewX: padX - int(math.Round(a.scrollX)), docY: byteAcc}
-			// approximate height based on style font size
-			attr := a.state.BlockStyleAttr(bi)
-			height := int(float64(attr.FontSizePt) * 1.3 * float64(a.uiScales[a.uiScaleIdx]))
-			if height < 12 {
-				height = 12
-			}
-			ll.y = y
-			ll.height = height
-			ll.ascent = int(float64(attr.FontSizePt) * 0.8)
-			ll.text = []byte(l)
-			a.lineLayouts = append(a.lineLayouts, ll)
-			y += height
-			// advance byte accumulator (account for newline except after last line)
-			byteAcc += len(l) + 1
-		}
-		// add spacing between blocks
-		y += 6
+
+	docY := 4
+	lineGap := int(4 * a.uiScales[a.uiScaleIdx])
+	if lineGap < 2 {
+		lineGap = 2
 	}
-	// compute max scroll extents
-	if y > a.contentRect.y+a.contentRect.h {
-		a.maxY = float64(y - (a.contentRect.y + a.contentRect.h))
-	} else {
-		a.maxY = 0
+	blockGap := int(8 * a.uiScales[a.uiScaleIdx])
+	if blockGap < 6 {
+		blockGap = 6
+	}
+	maxWidth := 0
+
+	for bi := 0; bi < a.state.BlockCount(); bi++ {
+		textBytes := []byte(a.state.AllBlockTexts()[bi])
+		runs := a.state.BlockRuns(bi)
+		if len(runs) == 0 {
+			runs = []sqdoc.StyleRun{{Start: 0, End: uint32(len(textBytes)), Attr: defaultAttr()}}
+		}
+
+		lineStart := 0
+		for {
+			relEnd := bytes.IndexByte(textBytes[lineStart:], '\n')
+			lineEnd := len(textBytes)
+			hasNL := false
+			if relEnd >= 0 {
+				lineEnd = lineStart + relEnd
+				hasNL = true
+			}
+
+			lineBytes := append([]byte(nil), textBytes[lineStart:lineEnd]...)
+			lineLen := len(lineBytes)
+			segments := make([]lineSegment, 0, len(runs))
+			lineWidth := 0
+			maxAscent := 0
+			maxDescent := 0
+
+			for _, run := range runs {
+				rs := int(run.Start)
+				re := int(run.End)
+				if re <= lineStart || rs >= lineEnd {
+					continue
+				}
+				segStart := max(rs, lineStart) - lineStart
+				segEnd := min(re, lineEnd) - lineStart
+				if segEnd < segStart {
+					continue
+				}
+				attr := run.Attr
+				if attr.FontSizePt == 0 {
+					attr.FontSizePt = 14
+				}
+				if attr.ColorRGBA == 0 {
+					attr.ColorRGBA = 0x202020FF
+				}
+				face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic)
+				segText := ""
+				if segStart < segEnd && segEnd <= lineLen {
+					segText = string(lineBytes[segStart:segEnd])
+				}
+				segW := a.measureString(face, segText)
+				m := face.Metrics()
+				if asc := m.Ascent.Round(); asc > maxAscent {
+					maxAscent = asc
+				}
+				if des := m.Descent.Round(); des > maxDescent {
+					maxDescent = des
+				}
+				segments = append(segments, lineSegment{
+					start: segStart,
+					end:   segEnd,
+					text:  segText,
+					attr:  attr,
+					face:  face,
+					width: segW,
+				})
+				lineWidth += segW
+			}
+
+			if len(segments) == 0 {
+				attr := defaultAttr()
+				if len(runs) > 0 {
+					attr = runs[0].Attr
+				}
+				face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic)
+				m := face.Metrics()
+				maxAscent = m.Ascent.Round()
+				maxDescent = m.Descent.Round()
+				segments = append(segments, lineSegment{
+					start: 0,
+					end:   lineLen,
+					text:  string(lineBytes),
+					attr:  attr,
+					face:  face,
+					width: a.measureString(face, string(lineBytes)),
+				})
+				lineWidth = segments[0].width
+			}
+
+			height := maxAscent + maxDescent + int(6*a.uiScales[a.uiScaleIdx])
+			if height < 18 {
+				height = 18
+			}
+			a.lineLayouts = append(a.lineLayouts, lineLayout{
+				block:     bi,
+				startByte: lineStart,
+				text:      lineBytes,
+				segments:  segments,
+				docX:      8,
+				docY:      docY,
+				height:    height,
+				ascent:    maxAscent,
+				width:     lineWidth,
+			})
+
+			if 8+lineWidth > maxWidth {
+				maxWidth = 8 + lineWidth
+			}
+			docY += height + lineGap
+
+			if !hasNL {
+				break
+			}
+			lineStart = lineEnd + 1
+		}
+		docY += blockGap
+	}
+
+	contentW := max(1, a.contentRect.w-12)
+	totalHeight := docY + 6
+	a.maxY = math.Max(0, float64(totalHeight-a.contentRect.h))
+	a.maxX = math.Max(0, float64(maxWidth-contentW))
+	a.clampScroll()
+
+	for i := range a.lineLayouts {
+		a.lineLayouts[i].y = a.contentRect.y + a.lineLayouts[i].docY - int(a.scrollY)
+		a.lineLayouts[i].viewX = a.contentRect.x + a.lineLayouts[i].docX - int(a.scrollX)
+		a.lineLayouts[i].baseline = a.lineLayouts[i].y + a.lineLayouts[i].ascent + 1
 	}
 }
 
 func (a *App) drawDocumentText(screen *ebiten.Image) {
-	for _, ll := range a.lineLayouts {
-		attr := a.state.BlockStyleAttr(ll.block)
-		face := a.uiFace(int(attr.FontSizePt), attr.Bold)
-		x := ll.viewX
-		y := ll.y - int(math.Round(a.scrollY)) + ll.ascent
-		text.Draw(screen, string(ll.text), face, x, y, rgbaFromUint32(attr.ColorRGBA))
+	if a.contentRect.w <= 0 || a.contentRect.h <= 0 {
+		return
 	}
+	if a.docLayer == nil || a.docLayer.Bounds().Dx() != a.contentRect.w || a.docLayer.Bounds().Dy() != a.contentRect.h {
+		a.docLayer = ebiten.NewImage(max(1, a.contentRect.w), max(1, a.contentRect.h))
+	}
+	a.docLayer.Clear()
+
+	highlightColor := color.RGBA{R: 255, G: 244, B: 168, A: 255}
+
+	for _, ll := range a.lineLayouts {
+		relY := ll.y - a.contentRect.y
+		if relY+ll.height < 0 || relY > a.contentRect.h {
+			continue
+		}
+		x := ll.viewX - a.contentRect.x
+		baseline := ll.baseline - a.contentRect.y
+		for _, seg := range ll.segments {
+			segX := x
+			if seg.attr.Highlight && seg.width > 0 {
+				top := baseline - seg.face.Metrics().Ascent.Round()
+				h := seg.face.Metrics().Ascent.Round() + seg.face.Metrics().Descent.Round()
+				if h < 12 {
+					h = 12
+				}
+				a.drawFilledRectOnScreen(a.docLayer, segX, top, seg.width, h, highlightColor)
+			}
+			if seg.text != "" {
+				clr := rgbaFromUint32(seg.attr.ColorRGBA)
+				text.Draw(a.docLayer, seg.text, seg.face, segX, baseline, clr)
+				if seg.attr.Underline {
+					underlineY := float64(baseline + max(1, seg.face.Metrics().Descent.Round()/2))
+					ebitenutil.DrawLine(a.docLayer, float64(segX), underlineY, float64(segX+seg.width), underlineY, clr)
+				}
+			}
+			x += seg.width
+		}
+	}
+
+	op := &ebiten.DrawImageOptions{}
+	op.GeoM.Translate(float64(a.contentRect.x), float64(a.contentRect.y))
+	screen.DrawImage(a.docLayer, op)
 }
 
 func (a *App) drawDocumentSelectionAndCaret() {
-	// minimal caret rendering
 	if a.state == nil {
 		return
 	}
-	cb := a.state.CaretByte
+
+	selColor := color.RGBA{R: 191, G: 214, B: 255, A: 255}
+	if start, end, ok := a.state.SelectionRange(); ok {
+		for _, ll := range a.lineLayouts {
+			if ll.block < start.Block || ll.block > end.Block {
+				continue
+			}
+			lineStart := ll.startByte
+			lineEnd := ll.startByte + len(ll.text)
+			selStart := lineStart
+			selEnd := lineEnd
+			if ll.block == start.Block {
+				selStart = start.Byte
+			}
+			if ll.block == end.Block {
+				selEnd = end.Byte
+			}
+			selStart = max(selStart, lineStart)
+			selEnd = min(selEnd, lineEnd)
+			if selEnd <= selStart {
+				continue
+			}
+			x0 := ll.viewX + a.lineAdvance(ll, selStart-lineStart)
+			x1 := ll.viewX + a.lineAdvance(ll, selEnd-lineStart)
+			a.fillRectWithinContent(x0, ll.y+1, x1-x0, ll.height-2, selColor)
+		}
+	}
+
+	if a.state.HasSelection() || (a.frameTick/30)%2 == 0 {
+		return
+	}
 	block := a.state.CurrentBlock
-	// find y for block
-	px := a.contentRect.x + 8 - int(math.Round(a.scrollX))
-	py := a.contentRect.y + 8
+	caret := a.state.CaretByte
 	for _, ll := range a.lineLayouts {
 		if ll.block != block {
-			py += ll.height
 			continue
 		}
-		// caret in this line? map caret byte pos into this line using docY
-		lineText := string(ll.text)
-		start := ll.docY
-		end := ll.docY + len(lineText)
-		if cb >= start && cb <= end {
-			rel := cb - start
-			if rel < 0 {
-				rel = 0
-			}
-			if rel > len(lineText) {
-				rel = len(lineText)
-			}
-			attr := a.state.BlockStyleAttr(block)
-			face := a.uiFace(int(attr.FontSizePt), attr.Bold)
-			sub := lineText[:rel]
-			x := px + a.measureString(face, sub)
-			y := ll.y - int(math.Round(a.scrollY))
-			// draw caret
-			for i := 0; i < 2; i++ {
-				a.frameBuffer.FillRect(x+i, y+2, 1, ll.height-4, color.RGBA{R: 21, G: 84, B: 164, A: 255})
-			}
-			break
+		lineStart := ll.startByte
+		lineEnd := lineStart + len(ll.text)
+		if caret < lineStart || caret > lineEnd {
+			continue
 		}
-		py += ll.height
+		rel := caret - lineStart
+		x := ll.viewX + a.lineAdvance(ll, rel)
+		a.fillRectWithinContent(x, ll.y+2, 1, max(2, ll.height-4), color.RGBA{R: 21, G: 84, B: 164, A: 255})
+		break
 	}
 }
 
 func (a *App) drawScrollbars() {
-	// simple visual indicators
 	if a.contentRect.w <= 0 || a.contentRect.h <= 0 {
 		return
 	}
-	// vertical
-	w := 8
-	x := a.contentRect.x + a.contentRect.w - w - 2
-	y := a.contentRect.y + 2
-	h := a.contentRect.h - 4
-	a.frameBuffer.FillRect(x, y, w, h, color.RGBA{R: 245, G: 247, B: 250, A: 255})
+
 	if a.maxY > 0 {
-		vh := int(float64(h) * float64(a.contentRect.h) / float64(float64(a.contentRect.h)+a.maxY))
-		if vh < 12 {
-			vh = 12
+		trackX := a.contentRect.x + a.contentRect.w - 6
+		trackY := a.contentRect.y + 2
+		trackH := a.contentRect.h - 8
+		a.frameBuffer.FillRect(trackX, trackY, 4, trackH, color.RGBA{R: 231, G: 236, B: 244, A: 255})
+		thumbH := max(24, int(float64(trackH)*float64(a.contentRect.h)/(float64(a.contentRect.h)+a.maxY)))
+		thumbY := trackY
+		if a.maxY > 0 {
+			thumbY = trackY + int((a.scrollY/a.maxY)*float64(trackH-thumbH))
 		}
-		pos := int((a.scrollY / a.maxY) * float64(h-vh))
-		if pos < 0 {
-			pos = 0
+		a.frameBuffer.FillRect(trackX, thumbY, 4, thumbH, color.RGBA{R: 156, G: 170, B: 190, A: 255})
+	}
+	if a.maxX > 0 {
+		trackX := a.contentRect.x + 2
+		trackY := a.contentRect.y + a.contentRect.h - 6
+		trackW := a.contentRect.w - 8
+		a.frameBuffer.FillRect(trackX, trackY, trackW, 4, color.RGBA{R: 231, G: 236, B: 244, A: 255})
+		thumbW := max(24, int(float64(trackW)*float64(a.contentRect.w)/(float64(a.contentRect.w)+a.maxX)))
+		thumbX := trackX
+		if a.maxX > 0 {
+			thumbX = trackX + int((a.scrollX/a.maxX)*float64(trackW-thumbW))
 		}
-		a.frameBuffer.FillRect(x+1, y+pos+1, w-2, vh-2, color.RGBA{R: 200, G: 210, B: 224, A: 255})
+		a.frameBuffer.FillRect(thumbX, trackY, thumbW, 4, color.RGBA{R: 156, G: 170, B: 190, A: 255})
 	}
 }
 
+// drawContentBorderOverlay draws the content rect borders on screen to cover overflowed text.
+func (a *App) drawContentBorderOverlay(screen *ebiten.Image) {
+	// stroke color same as frameBuffer strokes used earlier
+	c := color.RGBA{R: 187, G: 196, B: 210, A: 255}
+	x := a.contentRect.x
+	y := a.contentRect.y
+	w := a.contentRect.w
+	h := a.contentRect.h
+	// top
+	ebitenutil.DrawLine(screen, float64(x), float64(y), float64(x+w), float64(y), c)
+	// bottom
+	ebitenutil.DrawLine(screen, float64(x), float64(y+h), float64(x+w), float64(y+h), c)
+	// left
+	ebitenutil.DrawLine(screen, float64(x), float64(y), float64(x), float64(y+h), c)
+	// right
+	ebitenutil.DrawLine(screen, float64(x+w), float64(y), float64(x+w), float64(y+h), c)
+}
+
+// drawFilledRectOnScreen draws a filled rectangle on the screen by drawing horizontal lines.
+func (a *App) drawFilledRectOnScreen(screen *ebiten.Image, x, y, w, h int, c color.RGBA) {
+	for yy := y; yy < y+h; yy++ {
+		ebitenutil.DrawLine(screen, float64(x), float64(yy), float64(x+w), float64(yy), c)
+	}
+}
+
+func (a *App) drawColorPickerOverlay(screen *ebiten.Image) {
+	if !a.showColorPicker || a.colorPopupRect.w == 0 {
+		return
+	}
+	px := a.colorPopupRect.x
+	py := a.colorPopupRect.y
+	pw := a.colorPopupRect.w
+	ph := a.colorPopupRect.h
+	// background
+	a.drawFilledRectOnScreen(screen, px, py, pw, ph, color.RGBA{R: 249, G: 251, B: 254, A: 255})
+	// border
+	ebitenutil.DrawLine(screen, float64(px), float64(py), float64(px+pw), float64(py), color.RGBA{R: 178, G: 191, B: 210, A: 255})
+	ebitenutil.DrawLine(screen, float64(px), float64(py+ph), float64(px+pw), float64(py+ph), color.RGBA{R: 178, G: 191, B: 210, A: 255})
+	ebitenutil.DrawLine(screen, float64(px), float64(py), float64(px), float64(py+ph), color.RGBA{R: 178, G: 191, B: 210, A: 255})
+	ebitenutil.DrawLine(screen, float64(px+pw), float64(py), float64(px+pw), float64(py+ph), color.RGBA{R: 178, G: 191, B: 210, A: 255})
+	// caption
+	captionFace := a.uiFace(9, false, false)
+	text.Draw(screen, "Color", captionFace, px+8, py+14, color.RGBA{R: 44, G: 58, B: 82, A: 255})
+	// swatches (re-use positions in a.colorSwatches)
+	for _, sw := range a.colorSwatches {
+		// draw filled rect on screen
+		a.drawFilledRectOnScreen(screen, sw.r.x, sw.r.y, sw.r.w, sw.r.h, rgbaFromUint32(sw.value))
+		// border
+		ebitenutil.DrawLine(screen, float64(sw.r.x), float64(sw.r.y), float64(sw.r.x+sw.r.w), float64(sw.r.y), color.RGBA{R: 118, G: 132, B: 152, A: 255})
+		ebitenutil.DrawLine(screen, float64(sw.r.x), float64(sw.r.y+sw.r.h), float64(sw.r.x+sw.r.w), float64(sw.r.y+sw.r.h), color.RGBA{R: 118, G: 132, B: 152, A: 255})
+	}
+}
+
+func (a *App) layoutPasswordPromptBounds(w, h int) {
+	pw := int(460 * a.uiScales[a.uiScaleIdx])
+	ph := int(210 * a.uiScales[a.uiScaleIdx])
+	if pw > w-40 {
+		pw = w - 40
+	}
+	if ph > h-40 {
+		ph = h - 40
+	}
+	px := (w - pw) / 2
+	py := (h - ph) / 2
+	a.passwordPromptRect = rect{x: px, y: py, w: pw, h: ph}
+	a.passwordInputRect = rect{x: px + 20, y: py + 84, w: pw - 40, h: 34}
+	a.passwordSubmitRect = rect{x: px + pw - 186, y: py + ph - 46, w: 80, h: 30}
+	a.passwordCancelRect = rect{x: px + pw - 96, y: py + ph - 46, w: 80, h: 30}
+}
+
+func (a *App) drawPasswordPrompt(screen *ebiten.Image, w, h int) {
+	if !a.showPasswordPrompt {
+		return
+	}
+	a.layoutPasswordPromptBounds(w, h)
+
+	overlay := color.RGBA{R: 0, G: 0, B: 0, A: 90}
+	a.drawFilledRectOnScreen(screen, 0, 0, w, h, overlay)
+
+	r := a.passwordPromptRect
+	a.drawFilledRectOnScreen(screen, r.x, r.y, r.w, r.h, color.RGBA{R: 249, G: 251, B: 254, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x+r.w), float64(r.y), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y+r.h), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 160, G: 176, B: 198, A: 255})
+
+	titleFace := a.uiFace(12, true, false)
+	labelFace := a.uiFace(10, false, false)
+	text.Draw(screen, "Password Required", titleFace, r.x+20, r.y+30, color.RGBA{R: 24, G: 38, B: 56, A: 255})
+	fileLabel := "File: " + filepath.Base(a.passwordPromptPath)
+	text.Draw(screen, fileLabel, labelFace, r.x+20, r.y+54, color.RGBA{R: 52, G: 66, B: 92, A: 255})
+	text.Draw(screen, "Enter password to open this encrypted SQDoc:", labelFace, r.x+20, r.y+74, color.RGBA{R: 52, G: 66, B: 92, A: 255})
+
+	inputBg := color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	inputBorder := color.RGBA{R: 170, G: 184, B: 202, A: 255}
+	if a.passwordPromptFocused {
+		inputBg = color.RGBA{R: 244, G: 249, B: 255, A: 255}
+		inputBorder = color.RGBA{R: 77, G: 134, B: 205, A: 255}
+	}
+	a.drawFilledRectOnScreen(screen, a.passwordInputRect.x, a.passwordInputRect.y, a.passwordInputRect.w, a.passwordInputRect.h, inputBg)
+	ebitenutil.DrawLine(screen, float64(a.passwordInputRect.x), float64(a.passwordInputRect.y), float64(a.passwordInputRect.x+a.passwordInputRect.w), float64(a.passwordInputRect.y), inputBorder)
+	ebitenutil.DrawLine(screen, float64(a.passwordInputRect.x), float64(a.passwordInputRect.y+a.passwordInputRect.h), float64(a.passwordInputRect.x+a.passwordInputRect.w), float64(a.passwordInputRect.y+a.passwordInputRect.h), inputBorder)
+	ebitenutil.DrawLine(screen, float64(a.passwordInputRect.x), float64(a.passwordInputRect.y), float64(a.passwordInputRect.x), float64(a.passwordInputRect.y+a.passwordInputRect.h), inputBorder)
+	ebitenutil.DrawLine(screen, float64(a.passwordInputRect.x+a.passwordInputRect.w), float64(a.passwordInputRect.y), float64(a.passwordInputRect.x+a.passwordInputRect.w), float64(a.passwordInputRect.y+a.passwordInputRect.h), inputBorder)
+
+	masked := strings.Repeat("*", utf8.RuneCountInString(a.passwordPromptInput))
+	text.Draw(screen, masked, labelFace, a.passwordInputRect.x+8, a.passwordInputRect.y+22, color.RGBA{R: 42, G: 56, B: 80, A: 255})
+	if a.passwordPromptFocused && (a.frameTick/30)%2 == 0 {
+		caretX := a.passwordInputRect.x + 8 + a.measureString(labelFace, masked)
+		ebitenutil.DrawLine(screen, float64(caretX), float64(a.passwordInputRect.y+7), float64(caretX), float64(a.passwordInputRect.y+a.passwordInputRect.h-7), color.RGBA{R: 21, G: 84, B: 164, A: 255})
+	}
+
+	if a.passwordPromptError != "" {
+		text.Draw(screen, a.passwordPromptError, labelFace, r.x+20, a.passwordInputRect.y+a.passwordInputRect.h+22, color.RGBA{R: 165, G: 35, B: 35, A: 255})
+	}
+
+	a.drawFilledRectOnScreen(screen, a.passwordSubmitRect.x, a.passwordSubmitRect.y, a.passwordSubmitRect.w, a.passwordSubmitRect.h, color.RGBA{R: 217, G: 233, B: 250, A: 255})
+	a.drawFilledRectOnScreen(screen, a.passwordCancelRect.x, a.passwordCancelRect.y, a.passwordCancelRect.w, a.passwordCancelRect.h, color.RGBA{R: 236, G: 241, B: 248, A: 255})
+	text.Draw(screen, "Open", labelFace, a.passwordSubmitRect.x+24, a.passwordSubmitRect.y+20, color.RGBA{R: 30, G: 66, B: 118, A: 255})
+	text.Draw(screen, "Cancel", labelFace, a.passwordCancelRect.x+20, a.passwordCancelRect.y+20, color.RGBA{R: 52, G: 66, B: 92, A: 255})
+}
+
 func (a *App) hitTestPosition(x, y int) (int, int) {
-	// convert screen coords to block and byte offset within that block
-	if a.contentRect.contains(x, y) == false {
-		return 0, 0
+	if len(a.lineLayouts) == 0 {
+		return a.state.CurrentBlock, a.state.CaretByte
 	}
-	relY := y - a.contentRect.y + int(math.Round(a.scrollY)) - 8
-	acc := 0
+	first := a.lineLayouts[0]
+	if y <= first.y {
+		return first.block, first.startByte + a.byteAtX(first, x-first.viewX)
+	}
 	for _, ll := range a.lineLayouts {
-		if relY >= acc && relY < acc+ll.height {
-			// estimate byte offset by measuring runes
-			attr := a.state.BlockStyleAttr(ll.block)
-			face := a.uiFace(int(attr.FontSizePt), attr.Bold)
-			t := string(ll.text)
-			px := ll.viewX
-			// iterate runes
-			cur := 0
-			for i, r := range t {
-				// i is byte index within string
-				w := a.measureString(face, string(r))
-				if px+cur+w/2 >= x {
-					return ll.block, ll.docY + i
-				}
-				cur += w
-			}
-			return ll.block, ll.docY + len(t)
+		if y >= ll.y && y <= ll.y+ll.height {
+			return ll.block, ll.startByte + a.byteAtX(ll, x-ll.viewX)
 		}
-		acc += ll.height
 	}
-	// default to end
-	last := a.state.BlockCount() - 1
-	if last < 0 {
-		return 0, 0
+	last := a.lineLayouts[len(a.lineLayouts)-1]
+	return last.block, last.startByte + a.byteAtX(last, x-last.viewX)
+}
+
+func (a *App) lineAdvance(line lineLayout, relByte int) int {
+	if relByte <= 0 {
+		return 0
 	}
-	return last, len(a.state.AllBlockTexts()[last])
+	if relByte >= len(line.text) {
+		return line.width
+	}
+	advance := 0
+	for _, seg := range line.segments {
+		if relByte >= seg.end {
+			advance += seg.width
+			continue
+		}
+		if relByte <= seg.start {
+			break
+		}
+		part := string(line.text[seg.start:relByte])
+		advance += a.measureString(seg.face, part)
+		break
+	}
+	return advance
+}
+
+func (a *App) byteAtX(line lineLayout, relX int) int {
+	if relX <= 0 {
+		return 0
+	}
+	x := 0
+	for _, seg := range line.segments {
+		if relX > x+seg.width {
+			x += seg.width
+			continue
+		}
+		bytesSeg := line.text[seg.start:seg.end]
+		pos := seg.start
+		runX := x
+		for len(bytesSeg) > 0 {
+			r, size := utf8.DecodeRune(bytesSeg)
+			if size <= 0 {
+				size = 1
+			}
+			rw := a.measureString(seg.face, string(r))
+			if relX < runX+rw/2 {
+				return pos
+			}
+			runX += rw
+			pos += size
+			bytesSeg = bytesSeg[size:]
+		}
+		return seg.end
+	}
+	return len(line.text)
 }
 
 func (a *App) clampScroll() {
@@ -1410,34 +1896,54 @@ func (a *App) clampScroll() {
 	if a.scrollY < 0 {
 		a.scrollY = 0
 	}
+	if a.scrollX > a.maxX {
+		a.scrollX = a.maxX
+	}
+	if a.scrollY > a.maxY {
+		a.scrollY = a.maxY
+	}
 }
 
 func (a *App) ensureCaretVisible() {
-	if a.state == nil {
+	if len(a.lineLayouts) == 0 || a.contentRect.h <= 0 {
 		return
 	}
-	// find y position of caret
 	block := a.state.CurrentBlock
-	bytePos := a.state.CaretByte
-	acc := 0
+	caret := a.state.CaretByte
 	for _, ll := range a.lineLayouts {
 		if ll.block != block {
-			acc += ll.height
 			continue
 		}
-		// caret within this line? approximate
-		if bytePos <= len(ll.text) {
-			y := ll.y - int(math.Round(a.scrollY))
-			if y < a.contentRect.y+8 {
-				a.scrollY -= float64((a.contentRect.y + 8) - y)
-			}
-			if y+ll.height > a.contentRect.y+a.contentRect.h-8 {
-				a.scrollY += float64(y + ll.height - (a.contentRect.y + a.contentRect.h - 8))
-			}
-			return
+		lineStart := ll.startByte
+		lineEnd := lineStart + len(ll.text)
+		if caret < lineStart || caret > lineEnd {
+			continue
 		}
-		acc += ll.height
+		top := float64(ll.docY)
+		bottom := float64(ll.docY + ll.height)
+		viewTop := a.scrollY
+		viewBottom := a.scrollY + float64(a.contentRect.h)
+		if top < viewTop {
+			a.scrollY = top
+		}
+		if bottom > viewBottom {
+			a.scrollY = bottom - float64(a.contentRect.h)
+		}
+
+		rel := caret - lineStart
+		caretDocX := float64(ll.docX + a.lineAdvance(ll, rel))
+		viewLeft := a.scrollX
+		viewRight := a.scrollX + float64(a.contentRect.w-12)
+		padding := 16.0
+		if caretDocX < viewLeft+padding {
+			a.scrollX = math.Max(0, caretDocX-padding)
+		}
+		if caretDocX > viewRight-padding {
+			a.scrollX = caretDocX - float64(a.contentRect.w-12) + padding
+		}
+		break
 	}
+	a.clampScroll()
 }
 
 func (a *App) pushUndoSnapshot() {
@@ -1500,6 +2006,19 @@ func (a *App) openDocumentDialog() error {
 	}
 	doc, err := sqdoc.LoadWithOptions(path, sqdoc.LoadOptions{Password: a.encryptionPassword})
 	if err != nil {
+		if errors.Is(err, sqdoc.ErrPasswordRequired) || errors.Is(err, sqdoc.ErrInvalidPassword) {
+			a.showPasswordPrompt = true
+			a.passwordPromptFocused = true
+			a.passwordPromptPath = path
+			a.passwordPromptInput = ""
+			a.passwordPromptError = ""
+			a.dragSelecting = false
+			a.status = "Password required to open encrypted document"
+			if errors.Is(err, sqdoc.ErrInvalidPassword) {
+				a.passwordPromptError = "Incorrect password. Enter password to open."
+			}
+			return nil
+		}
 		return err
 	}
 	a.state = editor.NewState(doc)
@@ -1536,12 +2055,16 @@ func (a *App) bumpUIScale(delta int) {
 	if len(a.uiScales) == 0 {
 		return
 	}
+	prev := a.uiScaleIdx
 	a.uiScaleIdx += delta
 	if a.uiScaleIdx < 0 {
 		a.uiScaleIdx = 0
 	}
 	if a.uiScaleIdx >= len(a.uiScales) {
 		a.uiScaleIdx = len(a.uiScales) - 1
+	}
+	if prev != a.uiScaleIdx {
+		a.fonts.cache = map[fontKey]font.Face{}
 	}
 }
 
@@ -1559,6 +2082,8 @@ func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
 		"Ctrl+O: Open | Ctrl+N: New",
 		"Ctrl+Z: Undo | Ctrl+Y: Redo",
 		"Ctrl+B/I/U: Bold / Italic / Underline",
+		"Ctrl+Shift+H: Toggle text highlight",
+		"Ctrl+Backspace / Ctrl+Delete: Delete previous/next word",
 		"Mouse wheel: vertical scroll | Shift+wheel: horizontal",
 		"Click inside document to set caret; drag to select",
 	}
@@ -1567,6 +2092,35 @@ func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
 		text.Draw(screen, l, face, px+20, y, color.RGBA{R: 48, G: 60, B: 78, A: 255})
 		y += 22
 	}
+}
+
+func (a *App) fillRectWithinContent(x, y, w, h int, c color.RGBA) {
+	if w <= 0 || h <= 0 {
+		return
+	}
+	cx, cy, cw, ch := a.contentRect.x, a.contentRect.y, a.contentRect.w, a.contentRect.h
+	if x < cx {
+		w -= cx - x
+		x = cx
+	}
+	if y < cy {
+		h -= cy - y
+		y = cy
+	}
+	if x+w > cx+cw {
+		w = cx + cw - x
+	}
+	if y+h > cy+ch {
+		h = cy + ch - y
+	}
+	if w <= 0 || h <= 0 {
+		return
+	}
+	a.frameBuffer.FillRect(x, y, w, h, c)
+}
+
+func defaultAttr() sqdoc.StyleAttr {
+	return sqdoc.StyleAttr{FontSizePt: 14, ColorRGBA: 0x202020FF}
 }
 
 func rgbaFromUint32(u uint32) color.RGBA {

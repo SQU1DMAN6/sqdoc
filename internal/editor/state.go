@@ -380,6 +380,49 @@ func (s *State) DeleteForward() {
 	s.mergeBlocks(s.CurrentBlock, s.CurrentBlock+1)
 }
 
+func (s *State) DeleteWordBackward() {
+	s.Normalize()
+	if s.DeleteSelection() {
+		return
+	}
+
+	text := s.CurrentBlockText()
+	if s.CaretByte == 0 {
+		if s.CurrentBlock > 0 {
+			oldIdx := s.CurrentBlock
+			prevLen := len(blockText(s.Doc.Blocks[oldIdx-1]))
+			s.mergeBlocks(oldIdx-1, oldIdx)
+			s.CurrentBlock--
+			s.CaretByte = prevLen
+		}
+		return
+	}
+
+	start := previousWordBoundary(text, s.CaretByte)
+	insertAttr := s.styleAt(s.CurrentBlock, start)
+	s.replaceRangeInBlock(s.CurrentBlock, start, s.CaretByte, nil, insertAttr)
+	s.CaretByte = start
+}
+
+func (s *State) DeleteWordForward() {
+	s.Normalize()
+	if s.DeleteSelection() {
+		return
+	}
+
+	text := s.CurrentBlockText()
+	if s.CaretByte >= len(text) {
+		if s.CurrentBlock < len(s.Doc.Blocks)-1 {
+			s.mergeBlocks(s.CurrentBlock, s.CurrentBlock+1)
+		}
+		return
+	}
+
+	end := nextWordBoundary(text, s.CaretByte)
+	insertAttr := s.styleAt(s.CurrentBlock, s.CaretByte)
+	s.replaceRangeInBlock(s.CurrentBlock, s.CaretByte, end, nil, insertAttr)
+}
+
 func (s *State) ToggleBold() {
 	s.applyStyleMutation(func(attr *sqdoc.StyleAttr) { attr.Bold = !attr.Bold })
 }
@@ -390,6 +433,10 @@ func (s *State) ToggleItalic() {
 
 func (s *State) ToggleUnderline() {
 	s.applyStyleMutation(func(attr *sqdoc.StyleAttr) { attr.Underline = !attr.Underline })
+}
+
+func (s *State) ToggleHighlight() {
+	s.applyStyleMutation(func(attr *sqdoc.StyleAttr) { attr.Highlight = !attr.Highlight })
 }
 
 func (s *State) IncreaseFontSize() {
@@ -986,6 +1033,56 @@ func nextRuneBoundary(text []byte, pos int) int {
 	return pos + size
 }
 
+func previousWordBoundary(text []byte, pos int) int {
+	pos = clampToRuneBoundary(text, pos)
+	for pos > 0 {
+		r, size := utf8.DecodeLastRune(text[:pos])
+		if size <= 0 {
+			size = 1
+		}
+		if !unicode.IsSpace(r) {
+			break
+		}
+		pos -= size
+	}
+	for pos > 0 {
+		r, size := utf8.DecodeLastRune(text[:pos])
+		if size <= 0 {
+			size = 1
+		}
+		if unicode.IsSpace(r) {
+			break
+		}
+		pos -= size
+	}
+	return clampToRuneBoundary(text, pos)
+}
+
+func nextWordBoundary(text []byte, pos int) int {
+	pos = clampToRuneBoundary(text, pos)
+	for pos < len(text) {
+		r, size := utf8.DecodeRune(text[pos:])
+		if size <= 0 {
+			size = 1
+		}
+		if !unicode.IsSpace(r) {
+			break
+		}
+		pos += size
+	}
+	for pos < len(text) {
+		r, size := utf8.DecodeRune(text[pos:])
+		if size <= 0 {
+			size = 1
+		}
+		if unicode.IsSpace(r) {
+			break
+		}
+		pos += size
+	}
+	return clampToRuneBoundary(text, pos)
+}
+
 func comparePos(a, b Position) int {
 	if a.Block < b.Block {
 		return -1
@@ -1019,7 +1116,12 @@ func normalizeAttr(attr sqdoc.StyleAttr) sqdoc.StyleAttr {
 func attrsEqual(a, b sqdoc.StyleAttr) bool {
 	a = normalizeAttr(a)
 	b = normalizeAttr(b)
-	return a.Bold == b.Bold && a.Italic == b.Italic && a.Underline == b.Underline && a.FontSizePt == b.FontSizePt && a.ColorRGBA == b.ColorRGBA
+	return a.Bold == b.Bold &&
+		a.Italic == b.Italic &&
+		a.Underline == b.Underline &&
+		a.Highlight == b.Highlight &&
+		a.FontSizePt == b.FontSizePt &&
+		a.ColorRGBA == b.ColorRGBA
 }
 
 func sanitizeRuns(textLen int, runs []sqdoc.StyleRun) []sqdoc.StyleRun {

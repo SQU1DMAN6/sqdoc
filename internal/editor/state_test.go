@@ -151,3 +151,49 @@ func TestWordMovement(t *testing.T) {
 		t.Fatalf("unexpected word-right caret: %d", s.CaretByte)
 	}
 }
+
+func TestDeleteWordBackward(t *testing.T) {
+	s := NewState(sqdoc.NewDocument("", ""))
+	if err := s.UpdateCurrentText("hello brave world"); err != nil {
+		t.Fatal(err)
+	}
+	s.CaretByte = len("hello brave world")
+	s.DeleteWordBackward()
+	if got := s.CurrentText(); got != "hello brave " {
+		t.Fatalf("unexpected delete-word-backward result: %q", got)
+	}
+}
+
+func TestDeleteWordForward(t *testing.T) {
+	s := NewState(sqdoc.NewDocument("", ""))
+	if err := s.UpdateCurrentText("hello brave world"); err != nil {
+		t.Fatal(err)
+	}
+	s.CaretByte = len("hello ")
+	s.DeleteWordForward()
+	if got := s.CurrentText(); got != "hello  world" {
+		t.Fatalf("unexpected delete-word-forward result: %q", got)
+	}
+}
+
+func TestToggleHighlightOnSelection(t *testing.T) {
+	s := NewState(sqdoc.NewDocument("", ""))
+	if err := s.UpdateCurrentText("highlight me"); err != nil {
+		t.Fatal(err)
+	}
+	s.SetCaret(0, 0)
+	s.EnsureSelectionAnchor()
+	s.SetCaret(0, len("highlight"))
+	s.UpdateSelectionFromCaret()
+	s.ToggleHighlight()
+	s.ClearSelection()
+
+	s.SetCaret(0, 2)
+	if !s.CurrentStyleAttr().Highlight {
+		t.Fatalf("expected highlight on selected text")
+	}
+	s.SetCaret(0, len("highlight me"))
+	if s.CurrentStyleAttr().Highlight {
+		t.Fatalf("expected non-selected suffix to remain unhighlighted")
+	}
+}

@@ -18,7 +18,7 @@ func TestRoundTripSaveLoad(t *testing.T) {
 			Runs: []StyleRun{{
 				Start: 0,
 				End:   5,
-				Attr:  StyleAttr{Bold: true, FontSizePt: 12, ColorRGBA: 0x112233FF},
+				Attr:  StyleAttr{Bold: true, Highlight: true, FontSizePt: 12, ColorRGBA: 0x112233FF},
 			}},
 		},
 	})
@@ -41,7 +41,7 @@ func TestRoundTripSaveLoad(t *testing.T) {
 	if string(loaded.Blocks[0].Text.UTF8) != "Hello SQDoc" {
 		t.Fatalf("unexpected text payload: %q", string(loaded.Blocks[0].Text.UTF8))
 	}
-	if len(loaded.Blocks[0].Text.Runs) != 1 || !loaded.Blocks[0].Text.Runs[0].Attr.Bold {
+	if len(loaded.Blocks[0].Text.Runs) != 1 || !loaded.Blocks[0].Text.Runs[0].Attr.Bold || !loaded.Blocks[0].Text.Runs[0].Attr.Highlight {
 		t.Fatalf("style run mismatch: %#v", loaded.Blocks[0].Text.Runs)
 	}
 }

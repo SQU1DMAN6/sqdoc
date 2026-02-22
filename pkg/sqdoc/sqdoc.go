@@ -99,6 +99,7 @@ type StyleAttr struct {
 	Bold       bool
 	Italic     bool
 	Underline  bool
+	Highlight  bool
 	FontSizePt uint16
 	ColorRGBA  uint32
 }
@@ -603,6 +604,9 @@ func encodeFormattingDirective(entries []FormattingDirectiveEntry) []byte {
 		if e.Attr.Underline {
 			flags |= 4
 		}
+		if e.Attr.Highlight {
+			flags |= 8
+		}
 		out = append(out, flags)
 		out = appendU16(out, e.Attr.FontSizePt)
 		out = appendU32(out, e.Attr.ColorRGBA)
@@ -636,6 +640,7 @@ func decodeFormattingDirective(b []byte) ([]FormattingDirectiveEntry, error) {
 				Bold:       flags&1 != 0,
 				Italic:     flags&2 != 0,
 				Underline:  flags&4 != 0,
+				Highlight:  flags&8 != 0,
 				FontSizePt: fontSize,
 				ColorRGBA:  color,
 			},
@@ -752,6 +757,7 @@ func decodeTextBlock(b []byte) (*TextBlock, error) {
 				Bold:       flags&1 != 0,
 				Italic:     flags&2 != 0,
 				Underline:  flags&4 != 0,
+				Highlight:  flags&8 != 0,
 				FontSizePt: font,
 				ColorRGBA:  color,
 			},

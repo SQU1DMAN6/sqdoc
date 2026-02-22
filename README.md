@@ -44,11 +44,13 @@ build\windows\side.exe
 Current editor controls:
 - `Ctrl+N`: New document
 - `Ctrl+O`: Open via file explorer dialog
+- Encrypted open now triggers an in-app password popup prompt
 - `Ctrl+S`: Save (opens save dialog for untitled docs)
 - `Ctrl+Shift+S`: Save As via file explorer dialog
-- Top menu buttons (`New/Open/Save/Save As/Undo/Redo/A-/A+/Help`) are clickable
+- Top menu buttons (`New/Open/Save/Save As/Undo/Redo/Data Map/Encryption/A-/A+/Help`) are clickable
 - `Ctrl+Z` / `Ctrl+Y`: Undo / Redo
 - `Ctrl+P`: Toggle block map side panel
+- `Ctrl+E`: Toggle encryption view
 - `F1`: Toggle help overlay
 - Mouse click/drag: Caret placement and text selection
 - `Ctrl+C` / `Ctrl+X` / `Ctrl+V`: Copy / Cut / Paste
@@ -56,11 +58,14 @@ Current editor controls:
 - `Shift + Mouse wheel`: Horizontal scrolling
 - `Enter`: Split current block
 - `Backspace` / `Delete`: Delete/merge text across blocks
+- `Ctrl+Backspace` / `Ctrl+Delete`: Delete previous/next word
 - `Arrow Up/Down`: Switch blocks
 - `Arrow Left/Right`, `Home`, `End`: Caret movement
 - `Ctrl+Left/Right`: Word-wise caret movement
 - `Alt+Left/Right`: Jump to block start/end
 - `Ctrl+B`, `Ctrl+I`, `Ctrl+U`: Bold / Italic / Underline
+- `Ctrl+Shift+H`: Toggle highlight
 - `Ctrl+.` / `Ctrl+,`: Increase / Decrease font size
-- `Ctrl+Shift+C`: Cycle block color
+- Toolbar controls are clickable for `Bold/Italic/Underline/Highlight`, font step/input, and color picker
+- `Ctrl+Shift+C`: Cycle block color (keyboard shortcut)
 - `Ctrl +` / `Ctrl -`: UI scaling levels
