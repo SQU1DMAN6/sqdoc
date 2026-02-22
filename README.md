@@ -45,13 +45,14 @@ Current editor controls:
 - `Ctrl+N`: New document
 - `Ctrl+O`: Open via file explorer dialog
 - Encrypted open now triggers an in-app password popup prompt
+- Opened files auto-sync encryption/compression toggles from file envelope settings
 - `Ctrl+S`: Save (opens save dialog for untitled docs)
 - `Ctrl+Shift+S`: Save As via file explorer dialog
 - Top menu buttons (`New/Open/Save/Save As/Undo/Redo/Data Map/Encryption/A-/A+/Help`) are clickable
 - `Ctrl+Z` / `Ctrl+Y`: Undo / Redo
 - `Ctrl+P`: Toggle block map side panel
 - `Ctrl+E`: Toggle encryption view
-- `F1`: Toggle help overlay
+- `F1`: Toggle modal help dialog
 - Mouse click/drag: Caret placement and text selection
 - `Ctrl+C` / `Ctrl+X` / `Ctrl+V`: Copy / Cut / Paste
 - Mouse wheel / `PageUp` / `PageDown`: Vertical scrolling

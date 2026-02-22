@@ -147,7 +147,9 @@ type App struct {
 	status     string
 	frameTick  uint64
 
-	showHelp bool
+	showHelp  bool
+	helpRect  rect
+	helpClose rect
 
 	undoHistory []snapshot
 	redoHistory []snapshot
@@ -196,6 +198,9 @@ type App struct {
 	maxY    float64
 
 	dragSelecting bool
+
+	screenW int
+	screenH int
 }
 
 func New() *App {
@@ -239,17 +244,24 @@ func (a *App) Update() error {
 	ctrl := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
 	shift := ebiten.IsKeyPressed(ebiten.KeyShift)
 	alt := ebiten.IsKeyPressed(ebiten.KeyAlt)
-	winW, winH := ebiten.WindowSize()
+	winW, winH := a.currentViewportSize()
 	if a.showEncryption {
 		a.layoutEncryptionPanelBounds(winW, winH)
 	}
 	if a.showPasswordPrompt {
 		a.layoutPasswordPromptBounds(winW, winH)
 	}
+	if a.showHelp {
+		a.layoutHelpDialogBounds(winW, winH)
+	}
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 		if a.showPasswordPrompt {
 			a.closePasswordPrompt()
+			return nil
+		}
+		if a.showHelp {
+			a.showHelp = false
 			return nil
 		}
 		if a.fontInputActive {
@@ -280,6 +292,16 @@ func (a *App) Update() error {
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyE) {
 		a.showEncryption = !a.showEncryption
 		a.encryptionInputActive = a.showEncryption && a.encryptionEnabled
+	}
+	if a.showHelp {
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+			x, y := ebiten.CursorPosition()
+			if !a.helpRect.contains(x, y) || a.helpClose.contains(x, y) {
+				a.showHelp = false
+			}
+		}
+		a.clampScroll()
+		return nil
 	}
 
 	if a.handleOverlayTextInput(ctrl) {
@@ -312,14 +334,14 @@ func (a *App) Update() error {
 			a.handlePasswordPromptClick(x, y)
 			return nil
 		}
-		if id, ok := a.actionAt(x, y); ok {
-			a.invokeAction(id)
-			return nil
-		}
 		if a.showEncryption {
 			if a.handleEncryptionClick(x, y) {
 				return nil
 			}
+			return nil
+		}
+		if id, ok := a.actionAt(x, y); ok {
+			a.invokeAction(id)
 			return nil
 		}
 		if handled := a.handleToolbarClick(x, y); handled {
@@ -689,6 +711,7 @@ func (a *App) handleEncryptionClick(x, y int) bool {
 	if !a.showEncryption {
 		return false
 	}
+	// Keep the encryption panel modal: all clicks are consumed while open.
 	if !a.encryptionPanel.contains(x, y) {
 		a.showEncryption = false
 		a.encryptionInputActive = false
@@ -762,6 +785,12 @@ func (a *App) submitPasswordPrompt() {
 		a.closePasswordPrompt()
 		return
 	}
+	env, envErr := sqdoc.InspectEnvelope(filepath.Clean(path))
+	if envErr != nil {
+		a.status = "Open failed: " + envErr.Error()
+		a.closePasswordPrompt()
+		return
+	}
 	doc, err := sqdoc.LoadWithOptions(filepath.Clean(path), sqdoc.LoadOptions{Password: a.passwordPromptInput})
 	if err != nil {
 		if errors.Is(err, sqdoc.ErrPasswordRequired) || errors.Is(err, sqdoc.ErrInvalidPassword) {
@@ -781,6 +810,7 @@ func (a *App) submitPasswordPrompt() {
 	a.undoHistory = a.undoHistory[:0]
 	a.redoHistory = a.redoHistory[:0]
 	a.encryptionPassword = a.passwordPromptInput
+	a.applyEnvelopeSettings(env)
 	a.closePasswordPrompt()
 }
 
@@ -790,6 +820,16 @@ func (a *App) closePasswordPrompt() {
 	a.passwordPromptPath = ""
 	a.passwordPromptInput = ""
 	a.passwordPromptError = ""
+}
+
+func (a *App) applyEnvelopeSettings(info sqdoc.EnvelopeInfo) {
+	if info.Wrapped {
+		a.compressionEnabled = info.Compressed
+		a.encryptionEnabled = info.Encrypted
+		return
+	}
+	a.compressionEnabled = false
+	a.encryptionEnabled = false
 }
 
 func (a *App) handleToolbarClick(x, y int) bool {
@@ -987,7 +1027,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 	}
 	attr := a.state.CurrentStyleAttr()
 	statusLeft := fmt.Sprintf("[ Block %d/%d ] [ Caret %d ] [ Font %dpt ]", a.state.CurrentBlock+1, a.state.BlockCount(), a.state.CaretByte, attr.FontSizePt)
-	statusRight := fmt.Sprintf("%s | Scroll X %.0f%% Y %.0f%% | %s", name, scrollXPct, scrollYPct, a.status)
+	statusRight := fmt.Sprintf("[ %s ] [ Scroll X %.0f%% Y %.0f%% ] [ %s ]", name, scrollXPct, scrollYPct, a.status)
 	text.Draw(screen, statusLeft, statusFace, 12, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
 	text.Draw(screen, statusRight, statusFace, 320, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
 
@@ -1252,7 +1292,23 @@ func (a *App) Layout(outsideWidth, outsideHeight int) (screenWidth, screenHeight
 	if outsideHeight < 560 {
 		outsideHeight = 560
 	}
+	a.screenW = outsideWidth
+	a.screenH = outsideHeight
 	return outsideWidth, outsideHeight
+}
+
+func (a *App) currentViewportSize() (int, int) {
+	if a.screenW > 0 && a.screenH > 0 {
+		return a.screenW, a.screenH
+	}
+	w, h := ebiten.WindowSize()
+	if w <= 0 {
+		w = 1280
+	}
+	if h <= 0 {
+		h = 800
+	}
+	return w, h
 }
 
 func (a *App) layoutTopActions(face font.Face, layout ui.Layout) {
@@ -2004,6 +2060,23 @@ func (a *App) openDocumentDialog() error {
 	if path == "" {
 		return errors.New("no file selected")
 	}
+	path = filepath.Clean(path)
+	env, err := sqdoc.InspectEnvelope(path)
+	if err != nil {
+		return err
+	}
+	a.applyEnvelopeSettings(env)
+	if env.Encrypted && strings.TrimSpace(a.encryptionPassword) == "" {
+		a.showPasswordPrompt = true
+		a.passwordPromptFocused = true
+		a.passwordPromptPath = path
+		a.passwordPromptInput = ""
+		a.passwordPromptError = ""
+		a.dragSelecting = false
+		a.status = "Password required to open encrypted document"
+		return nil
+	}
+
 	doc, err := sqdoc.LoadWithOptions(path, sqdoc.LoadOptions{Password: a.encryptionPassword})
 	if err != nil {
 		if errors.Is(err, sqdoc.ErrPasswordRequired) || errors.Is(err, sqdoc.ErrInvalidPassword) {
@@ -2024,6 +2097,7 @@ func (a *App) openDocumentDialog() error {
 	a.state = editor.NewState(doc)
 	a.filePath = path
 	a.status = "Opened " + filepath.Base(path)
+	a.applyEnvelopeSettings(env)
 	return nil
 }
 
@@ -2068,16 +2142,39 @@ func (a *App) bumpUIScale(delta int) {
 	}
 }
 
-func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
-	w, h := screen.Bounds().Dx(), screen.Bounds().Dy()
-	panelW := int(float64(w) * 0.6)
-	panelH := int(float64(h) * 0.6)
+func (a *App) layoutHelpDialogBounds(w, h int) {
+	panelW := int(float64(w) * 0.68)
+	panelH := int(float64(h) * 0.68)
+	if panelW > w-40 {
+		panelW = w - 40
+	}
+	if panelH > h-40 {
+		panelH = h - 40
+	}
 	px := (w - panelW) / 2
 	py := (h - panelH) / 2
-	a.frameBuffer.FillRect(px, py, panelW, panelH, color.RGBA{R: 250, G: 251, B: 253, A: 255})
-	a.frameBuffer.StrokeRect(px, py, panelW, panelH, 1, color.RGBA{R: 170, G: 184, B: 202, A: 255})
+	a.helpRect = rect{x: px, y: py, w: panelW, h: panelH}
+	a.helpClose = rect{x: px + panelW - 94, y: py + 12, w: 78, h: 30}
+}
+
+func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
+	w, h := screen.Bounds().Dx(), screen.Bounds().Dy()
+	a.layoutHelpDialogBounds(w, h)
+	r := a.helpRect
+	a.drawFilledRectOnScreen(screen, 0, 0, w, h, color.RGBA{R: 0, G: 0, B: 0, A: 90})
+	a.drawFilledRectOnScreen(screen, r.x, r.y, r.w, r.h, color.RGBA{R: 250, G: 251, B: 253, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x+r.w), float64(r.y), color.RGBA{R: 170, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y+r.h), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 170, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 170, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 170, G: 184, B: 202, A: 255})
+
+	a.drawFilledRectOnScreen(screen, a.helpClose.x, a.helpClose.y, a.helpClose.w, a.helpClose.h, color.RGBA{R: 236, G: 241, B: 248, A: 255})
+	text.Draw(screen, "Close", face, a.helpClose.x+22, a.helpClose.y+20, color.RGBA{R: 52, G: 66, B: 92, A: 255})
+
+	titleFace := a.uiFace(12, true, false)
+	text.Draw(screen, "Help", titleFace, r.x+22, r.y+30, color.RGBA{R: 30, G: 45, B: 67, A: 255})
+
 	lines := []string{
-		"Help - Keyboard Shortcuts:",
 		"Ctrl+S: Save | Ctrl+Shift+S: Save As",
 		"Ctrl+O: Open | Ctrl+N: New",
 		"Ctrl+Z: Undo | Ctrl+Y: Redo",
@@ -2086,11 +2183,13 @@ func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
 		"Ctrl+Backspace / Ctrl+Delete: Delete previous/next word",
 		"Mouse wheel: vertical scroll | Shift+wheel: horizontal",
 		"Click inside document to set caret; drag to select",
+		"F1 or Esc closes this dialog",
 	}
-	y := py + 28
+	y := r.y + 62
+	labelFace := a.uiFace(10, false, false)
 	for _, l := range lines {
-		text.Draw(screen, l, face, px+20, y, color.RGBA{R: 48, G: 60, B: 78, A: 255})
-		y += 22
+		text.Draw(screen, l, labelFace, r.x+20, y, color.RGBA{R: 48, G: 60, B: 78, A: 255})
+		y += int(24 * a.uiScales[a.uiScaleIdx])
 	}
 }
 

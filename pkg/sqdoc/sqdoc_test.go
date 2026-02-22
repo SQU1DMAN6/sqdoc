@@ -249,3 +249,67 @@ func TestIndexIsAtStartAndDataBlocksAfterDirective(t *testing.T) {
 		t.Fatalf("expected 2 data entries, got %d", dataCount)
 	}
 }
+
+func TestEncryptedSaveRequiresPasswordOnLoad(t *testing.T) {
+	doc := NewDocument("author", "enc")
+	doc.Blocks = append(doc.Blocks, Block{
+		ID:   1,
+		Kind: BlockKindText,
+		Text: &TextBlock{UTF8: []byte("secret"), Runs: []StyleRun{{Start: 0, End: 6, Attr: StyleAttr{FontSizePt: 12}}}},
+	})
+
+	path := filepath.Join(t.TempDir(), "encrypted.sqdoc")
+	err := SaveWithOptions(path, doc, SaveOptions{
+		Compression: true,
+		Encryption:  EncryptionOptions{Enabled: true, Password: "hunter2"},
+	})
+	if err != nil {
+		t.Fatalf("save encrypted failed: %v", err)
+	}
+
+	if _, err := LoadWithOptions(path, LoadOptions{}); !errors.Is(err, ErrPasswordRequired) {
+		t.Fatalf("expected ErrPasswordRequired, got %v", err)
+	}
+	if _, err := LoadWithOptions(path, LoadOptions{Password: "wrong"}); !errors.Is(err, ErrInvalidPassword) {
+		t.Fatalf("expected ErrInvalidPassword, got %v", err)
+	}
+	if _, err := LoadWithOptions(path, LoadOptions{Password: "hunter2"}); err != nil {
+		t.Fatalf("expected successful decrypt load, got %v", err)
+	}
+}
+
+func TestInspectEnvelopeFlags(t *testing.T) {
+	doc := NewDocument("author", "flags")
+	doc.Blocks = append(doc.Blocks, Block{
+		ID:   1,
+		Kind: BlockKindText,
+		Text: &TextBlock{UTF8: []byte("abc"), Runs: []StyleRun{{Start: 0, End: 3, Attr: StyleAttr{FontSizePt: 12}}}},
+	})
+
+	plain := filepath.Join(t.TempDir(), "plain.sqdoc")
+	if err := SaveWithOptions(plain, doc, SaveOptions{}); err != nil {
+		t.Fatalf("save plain failed: %v", err)
+	}
+	info, err := InspectEnvelope(plain)
+	if err != nil {
+		t.Fatalf("inspect plain failed: %v", err)
+	}
+	if info.Wrapped {
+		t.Fatalf("expected plain file to be unwrapped")
+	}
+
+	secure := filepath.Join(t.TempDir(), "secure.sqdoc")
+	if err := SaveWithOptions(secure, doc, SaveOptions{
+		Compression: true,
+		Encryption:  EncryptionOptions{Enabled: true, Password: "pw"},
+	}); err != nil {
+		t.Fatalf("save secure failed: %v", err)
+	}
+	info, err = InspectEnvelope(secure)
+	if err != nil {
+		t.Fatalf("inspect secure failed: %v", err)
+	}
+	if !info.Wrapped || !info.Compressed || !info.Encrypted {
+		t.Fatalf("unexpected envelope flags: %#v", info)
+	}
+}

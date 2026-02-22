@@ -56,6 +56,13 @@ type LoadOptions struct {
 	Password string
 }
 
+type EnvelopeInfo struct {
+	Wrapped     bool
+	Compressed  bool
+	Encrypted   bool
+	EnvelopeVer uint16
+}
+
 type BlockKind uint8
 
 const (
@@ -216,10 +223,6 @@ func SaveWithOptions(path string, doc *Document, opts SaveOptions) error {
 		if stringsTrim(opts.Encryption.Password) == "" {
 			return ErrPasswordRequired
 		}
-		blob, err = encryptBytes(blob, opts.Encryption.Password)
-		if err != nil {
-			return err
-		}
 	}
 
 	if opts.Compression || opts.Encryption.Enabled {
@@ -262,6 +265,14 @@ func LoadWithOptions(path string, opts LoadOptions) (*Document, error) {
 		return nil, err
 	}
 	return doc, nil
+}
+
+func InspectEnvelope(path string) (EnvelopeInfo, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return EnvelopeInfo{}, err
+	}
+	return inspectEnvelopeBytes(b)
 }
 
 func InspectLayout(doc *Document) (*LayoutInfo, error) {
@@ -822,6 +833,26 @@ func isSecureEnvelope(b []byte) bool {
 	return len(b) >= len(secureMagic) && string(b[:len(secureMagic)]) == secureMagic
 }
 
+func inspectEnvelopeBytes(b []byte) (EnvelopeInfo, error) {
+	info := EnvelopeInfo{}
+	if !isSecureEnvelope(b) {
+		return info, nil
+	}
+	if len(b) < secureHeaderSize {
+		return info, ErrInvalidSecureFile
+	}
+	version := binary.LittleEndian.Uint16(b[len(secureMagic) : len(secureMagic)+2])
+	if version != secureVersionV1 {
+		return info, fmt.Errorf("%w: secure envelope version %d", ErrUnsupportedVer, version)
+	}
+	flags := binary.LittleEndian.Uint16(b[len(secureMagic)+2 : len(secureMagic)+4])
+	info.Wrapped = true
+	info.Compressed = flags&secureFlagComp != 0
+	info.Encrypted = flags&secureFlagEnc != 0
+	info.EnvelopeVer = version
+	return info, nil
+}
+
 func encodeSecureEnvelope(payload []byte, opts SaveOptions) ([]byte, error) {
 	flags := uint16(0)
 	if opts.Compression {
@@ -865,15 +896,12 @@ func encodeSecureEnvelope(payload []byte, opts SaveOptions) ([]byte, error) {
 }
 
 func decodeSecureEnvelope(b []byte, opts LoadOptions) ([]byte, error) {
-	if len(b) < secureHeaderSize {
-		return nil, ErrInvalidSecureFile
+	info, err := inspectEnvelopeBytes(b)
+	if err != nil {
+		return nil, err
 	}
-	if string(b[:len(secureMagic)]) != secureMagic {
+	if !info.Wrapped {
 		return nil, ErrInvalidSecureFile
-	}
-	version := binary.LittleEndian.Uint16(b[len(secureMagic) : len(secureMagic)+2])
-	if version != secureVersionV1 {
-		return nil, fmt.Errorf("%w: secure envelope version %d", ErrUnsupportedVer, version)
 	}
 	flags := binary.LittleEndian.Uint16(b[len(secureMagic)+2 : len(secureMagic)+4])
 	salt := append([]byte(nil), b[len(secureMagic)+4:len(secureMagic)+4+secureSaltSize]...)
@@ -937,9 +965,4 @@ func decompressBytes(in []byte) ([]byte, error) {
 	}
 	defer r.Close()
 	return io.ReadAll(r)
-}
-
-func encryptBytes(in []byte, _ string) ([]byte, error) {
-	// Kept as a dedicated hook for future envelope variants.
-	return in, nil
 }
