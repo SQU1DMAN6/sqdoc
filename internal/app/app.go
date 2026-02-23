@@ -1356,7 +1356,7 @@ func (a *App) drawEncryptionLabels(screen *ebiten.Image, face font.Face) {
 	text.Draw(screen, "Compression (zlib)", labelFace, a.encryptionCompRect.x+28, a.encryptionCompRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "AES-256 password protection", labelFace, a.encryptionEncRect.x+28, a.encryptionEncRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "Password", labelFace, a.encryptionPassRect.x, a.encryptionPassRect.y-6, color.RGBA{R: 52, G: 66, B: 92, A: 255})
-	text.Draw(screen, "Paged Modes", labelFace, a.encryptionPagedRect.x+28, a.encryptionPagedRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	text.Draw(screen, "Paged Mode", labelFace, a.encryptionPagedRect.x+28, a.encryptionPagedRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "Paragraph gap", labelFace, a.encryptionGapDownRect.x+24, a.encryptionGapDownRect.y+16, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, fmt.Sprintf("%d", a.paragraphGap), labelFace, a.encryptionGapDownRect.x+240, a.encryptionGapDownRect.y+16, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "Default font family", labelFace, a.encryptionFontSans.x, a.encryptionFontSans.y-6, color.RGBA{R: 52, G: 66, B: 92, A: 255})
@@ -1373,9 +1373,6 @@ func (a *App) drawEncryptionLabels(screen *ebiten.Image, face font.Face) {
 		caretX := a.encryptionPassRect.x + 8 + a.measureString(labelFace, masked)
 		ebitenutil.DrawLine(screen, float64(caretX), float64(a.encryptionPassRect.y+7), float64(caretX), float64(a.encryptionPassRect.y+a.encryptionPassRect.h-7), color.RGBA{R: 21, G: 84, B: 164, A: 255})
 	}
-
-	hint := "Settings are per-document tab. Save writes paged mode + paragraph gap + preferred font."
-	text.Draw(screen, hint, labelFace, a.encryptionPanel.x+16, a.encryptionPanel.y+a.encryptionPanel.h-12, color.RGBA{R: 74, G: 88, B: 112, A: 255})
 }
 
 func (a *App) layoutEncryptionPanelBounds(w, h int) {
