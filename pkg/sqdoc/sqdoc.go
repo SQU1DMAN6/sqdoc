@@ -28,7 +28,8 @@ const (
 
 	headerSize  = 42
 	tocEntSize  = 8 + 1 + 8 + 4 + 4
-	styleEntSz  = 8 + 4 + 4 + 1 + 2 + 4
+	styleEntSz  = 8 + 4 + 4 + 1 + 1 + 2 + 4
+	styleEntV1  = 8 + 4 + 4 + 1 + 2 + 4
 	metaBlockID = uint64(0)
 	fmtBlockID  = ^uint64(0)
 
@@ -78,11 +79,22 @@ type Document struct {
 	Blocks   []Block
 }
 
+type FontFamily uint8
+
+const (
+	FontFamilySans FontFamily = iota
+	FontFamilySerif
+	FontFamilyMonospace
+)
+
 type Metadata struct {
-	Author       string
-	Title        string
-	CreatedUnix  int64
-	ModifiedUnix int64
+	Author              string
+	Title               string
+	CreatedUnix         int64
+	ModifiedUnix        int64
+	PagedMode           bool
+	ParagraphGap        uint16
+	PreferredFontFamily FontFamily
 }
 
 type Block struct {
@@ -107,6 +119,7 @@ type StyleAttr struct {
 	Italic     bool
 	Underline  bool
 	Highlight  bool
+	FontFamily FontFamily
 	FontSizePt uint16
 	ColorRGBA  uint32
 }
@@ -169,7 +182,15 @@ var (
 
 func NewDocument(author, title string) *Document {
 	now := time.Now().Unix()
-	return &Document{Metadata: Metadata{Author: author, Title: title, CreatedUnix: now, ModifiedUnix: now}}
+	return &Document{Metadata: Metadata{
+		Author:              author,
+		Title:               title,
+		CreatedUnix:         now,
+		ModifiedUnix:        now,
+		PagedMode:           false,
+		ParagraphGap:        8,
+		PreferredFontFamily: FontFamilySans,
+	}}
 }
 
 func CloneDocument(doc *Document) *Document {
@@ -333,6 +354,9 @@ func Validate(doc *Document) error {
 	if !utf8.ValidString(doc.Metadata.Author) || !utf8.ValidString(doc.Metadata.Title) {
 		return errors.New("sqdoc: metadata fields must be valid UTF-8")
 	}
+	if !isValidFontFamily(doc.Metadata.PreferredFontFamily) {
+		return errors.New("sqdoc: metadata preferred font family is invalid")
+	}
 
 	seenIDs := map[uint64]struct{}{}
 	for i := range doc.Blocks {
@@ -389,6 +413,9 @@ func validateRuns(tb *TextBlock) error {
 		}
 		if r.Attr.FontSizePt == 0 {
 			return errors.New("font size must be non-zero")
+		}
+		if !isValidFontFamily(r.Attr.FontFamily) {
+			return errors.New("font family is invalid")
 		}
 		lastEnd = r.End
 	}
@@ -619,6 +646,7 @@ func encodeFormattingDirective(entries []FormattingDirectiveEntry) []byte {
 			flags |= 8
 		}
 		out = append(out, flags)
+		out = append(out, byte(normalizeFontFamily(e.Attr.FontFamily)))
 		out = appendU16(out, e.Attr.FontSizePt)
 		out = appendU32(out, e.Attr.ColorRGBA)
 	}
@@ -632,17 +660,34 @@ func decodeFormattingDirective(b []byte) ([]FormattingDirectiveEntry, error) {
 	count := int(binary.LittleEndian.Uint32(b[:4]))
 	ptr := 4
 	out := make([]FormattingDirectiveEntry, 0, count)
+	if count == 0 {
+		return out, nil
+	}
+	remaining := len(b) - 4
+	if remaining < 0 || remaining%count != 0 {
+		return nil, errors.New("sqdoc: malformed formatting directive entry length")
+	}
+	entrySize := remaining / count
+	if entrySize != styleEntSz && entrySize != styleEntV1 {
+		return nil, errors.New("sqdoc: unsupported formatting directive entry size")
+	}
 	for i := 0; i < count; i++ {
-		if len(b[ptr:]) < styleEntSz {
+		if len(b[ptr:]) < entrySize {
 			return nil, errors.New("sqdoc: malformed formatting directive entry")
 		}
 		blockID := binary.LittleEndian.Uint64(b[ptr : ptr+8])
 		start := binary.LittleEndian.Uint32(b[ptr+8 : ptr+12])
 		end := binary.LittleEndian.Uint32(b[ptr+12 : ptr+16])
 		flags := b[ptr+16]
-		fontSize := binary.LittleEndian.Uint16(b[ptr+17 : ptr+19])
-		color := binary.LittleEndian.Uint32(b[ptr+19 : ptr+23])
-		ptr += styleEntSz
+		fontFamily := FontFamilySans
+		fontOffset := 17
+		if entrySize == styleEntSz {
+			fontFamily = normalizeFontFamily(FontFamily(b[ptr+17]))
+			fontOffset = 18
+		}
+		fontSize := binary.LittleEndian.Uint16(b[ptr+fontOffset : ptr+fontOffset+2])
+		color := binary.LittleEndian.Uint32(b[ptr+fontOffset+2 : ptr+fontOffset+6])
+		ptr += entrySize
 		out = append(out, FormattingDirectiveEntry{
 			BlockID: blockID,
 			Start:   start,
@@ -652,6 +697,7 @@ func decodeFormattingDirective(b []byte) ([]FormattingDirectiveEntry, error) {
 				Italic:     flags&2 != 0,
 				Underline:  flags&4 != 0,
 				Highlight:  flags&8 != 0,
+				FontFamily: fontFamily,
 				FontSizePt: fontSize,
 				ColorRGBA:  color,
 			},
@@ -690,6 +736,13 @@ func encodeMetadata(m Metadata) []byte {
 	out = appendString(out, m.Title)
 	out = appendI64(out, m.CreatedUnix)
 	out = appendI64(out, m.ModifiedUnix)
+	flags := byte(0)
+	if m.PagedMode {
+		flags |= 1
+	}
+	out = append(out, flags)
+	out = appendU16(out, m.ParagraphGap)
+	out = append(out, byte(normalizeFontFamily(m.PreferredFontFamily)))
 	return out
 }
 
@@ -707,6 +760,20 @@ func decodeMetadata(b []byte) (Metadata, error) {
 	}
 	m.CreatedUnix = int64(binary.LittleEndian.Uint64(b[:8]))
 	m.ModifiedUnix = int64(binary.LittleEndian.Uint64(b[8:16]))
+	b = b[16:]
+	if len(b) == 0 {
+		m.PagedMode = false
+		m.ParagraphGap = 8
+		m.PreferredFontFamily = FontFamilySans
+		return m, nil
+	}
+	if len(b) < 4 {
+		return m, errors.New("sqdoc: malformed metadata settings")
+	}
+	flags := b[0]
+	m.PagedMode = flags&1 != 0
+	m.ParagraphGap = binary.LittleEndian.Uint16(b[1:3])
+	m.PreferredFontFamily = normalizeFontFamily(FontFamily(b[3]))
 	return m, nil
 }
 
@@ -769,6 +836,7 @@ func decodeTextBlock(b []byte) (*TextBlock, error) {
 				Italic:     flags&2 != 0,
 				Underline:  flags&4 != 0,
 				Highlight:  flags&8 != 0,
+				FontFamily: FontFamilySans,
 				FontSizePt: font,
 				ColorRGBA:  color,
 			},
@@ -827,6 +895,17 @@ func stringsTrim(s string) string {
 		j--
 	}
 	return s[i:j]
+}
+
+func isValidFontFamily(f FontFamily) bool {
+	return f == FontFamilySans || f == FontFamilySerif || f == FontFamilyMonospace
+}
+
+func normalizeFontFamily(f FontFamily) FontFamily {
+	if !isValidFontFamily(f) {
+		return FontFamilySans
+	}
+	return f
 }
 
 func isSecureEnvelope(b []byte) bool {

@@ -496,6 +496,15 @@ func (s *State) SetFontSize(pt uint16) {
 	})
 }
 
+func (s *State) SetFontFamily(family sqdoc.FontFamily) {
+	if !isValidFontFamily(family) {
+		family = sqdoc.FontFamilySans
+	}
+	s.applyStyleMutation(func(attr *sqdoc.StyleAttr) {
+		attr.FontFamily = family
+	})
+}
+
 func (s *State) CurrentStyleAttr() sqdoc.StyleAttr {
 	return s.currentStyleAttr()
 }
@@ -1100,7 +1109,7 @@ func comparePos(a, b Position) int {
 }
 
 func defaultStyleAttr() sqdoc.StyleAttr {
-	return sqdoc.StyleAttr{FontSizePt: 14, ColorRGBA: 0x202020FF}
+	return sqdoc.StyleAttr{FontSizePt: 14, ColorRGBA: 0x202020FF, FontFamily: sqdoc.FontFamilySans}
 }
 
 func normalizeAttr(attr sqdoc.StyleAttr) sqdoc.StyleAttr {
@@ -1109,6 +1118,9 @@ func normalizeAttr(attr sqdoc.StyleAttr) sqdoc.StyleAttr {
 	}
 	if attr.ColorRGBA == 0 {
 		attr.ColorRGBA = 0x202020FF
+	}
+	if !isValidFontFamily(attr.FontFamily) {
+		attr.FontFamily = sqdoc.FontFamilySans
 	}
 	return attr
 }
@@ -1120,8 +1132,13 @@ func attrsEqual(a, b sqdoc.StyleAttr) bool {
 		a.Italic == b.Italic &&
 		a.Underline == b.Underline &&
 		a.Highlight == b.Highlight &&
+		a.FontFamily == b.FontFamily &&
 		a.FontSizePt == b.FontSizePt &&
 		a.ColorRGBA == b.ColorRGBA
+}
+
+func isValidFontFamily(f sqdoc.FontFamily) bool {
+	return f == sqdoc.FontFamilySans || f == sqdoc.FontFamilySerif || f == sqdoc.FontFamilyMonospace
 }
 
 func sanitizeRuns(textLen int, runs []sqdoc.StyleRun) []sqdoc.StyleRun {

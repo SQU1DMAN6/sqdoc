@@ -313,3 +313,48 @@ func TestInspectEnvelopeFlags(t *testing.T) {
 		t.Fatalf("unexpected envelope flags: %#v", info)
 	}
 }
+
+func TestRoundTripPreservesDocumentSettingsAndFontFamily(t *testing.T) {
+	doc := NewDocument("author", "settings")
+	doc.Metadata.PagedMode = true
+	doc.Metadata.ParagraphGap = 14
+	doc.Metadata.PreferredFontFamily = FontFamilyMonospace
+	doc.Blocks = append(doc.Blocks, Block{
+		ID:   1,
+		Kind: BlockKindText,
+		Text: &TextBlock{
+			UTF8: []byte("hello world"),
+			Runs: []StyleRun{{
+				Start: 0,
+				End:   11,
+				Attr: StyleAttr{
+					FontFamily: FontFamilySerif,
+					FontSizePt: 14,
+					ColorRGBA:  0x202020FF,
+				},
+			}},
+		},
+	})
+
+	path := filepath.Join(t.TempDir(), "settings_font.sqdoc")
+	if err := Save(path, doc); err != nil {
+		t.Fatalf("save failed: %v", err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatalf("load failed: %v", err)
+	}
+
+	if !loaded.Metadata.PagedMode {
+		t.Fatalf("expected paged mode true")
+	}
+	if loaded.Metadata.ParagraphGap != 14 {
+		t.Fatalf("paragraph gap mismatch: got %d", loaded.Metadata.ParagraphGap)
+	}
+	if loaded.Metadata.PreferredFontFamily != FontFamilyMonospace {
+		t.Fatalf("preferred font mismatch: got %d", loaded.Metadata.PreferredFontFamily)
+	}
+	if got := loaded.Blocks[0].Text.Runs[0].Attr.FontFamily; got != FontFamilySerif {
+		t.Fatalf("run font family mismatch: got %d", got)
+	}
+}

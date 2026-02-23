@@ -28,6 +28,12 @@ import (
 	"golang.org/x/image/font/gofont/gobold"
 	"golang.org/x/image/font/gofont/gobolditalic"
 	"golang.org/x/image/font/gofont/goitalic"
+	"golang.org/x/image/font/gofont/gomedium"
+	"golang.org/x/image/font/gofont/gomediumitalic"
+	"golang.org/x/image/font/gofont/gomono"
+	"golang.org/x/image/font/gofont/gomonobold"
+	"golang.org/x/image/font/gofont/gomonobolditalic"
+	"golang.org/x/image/font/gofont/gomonoitalic"
 	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
 )
@@ -54,6 +60,29 @@ type actionButton struct {
 	label  string
 	r      rect
 	active bool
+}
+
+type documentTab struct {
+	id int
+
+	state    *editor.State
+	filePath string
+
+	undoHistory []snapshot
+	redoHistory []snapshot
+
+	scrollX float64
+	scrollY float64
+	maxX    float64
+	maxY    float64
+
+	encryptionEnabled  bool
+	compressionEnabled bool
+	encryptionPassword string
+
+	pagedMode           bool
+	paragraphGap        int
+	preferredFontFamily sqdoc.FontFamily
 }
 
 type colorSwatch struct {
@@ -92,6 +121,7 @@ type lineLayout struct {
 }
 
 type fontKey struct {
+	family sqdoc.FontFamily
 	size   int
 	bold   bool
 	italic bool
@@ -99,41 +129,66 @@ type fontKey struct {
 }
 
 type fontBank struct {
-	regular    *opentype.Font
-	bold       *opentype.Font
-	italic     *opentype.Font
-	boldItalic *opentype.Font
-	cache      map[fontKey]font.Face
+	sansRegular    *opentype.Font
+	sansBold       *opentype.Font
+	sansItalic     *opentype.Font
+	sansBoldItalic *opentype.Font
+
+	serifRegular    *opentype.Font
+	serifBold       *opentype.Font
+	serifItalic     *opentype.Font
+	serifBoldItalic *opentype.Font
+
+	monoRegular    *opentype.Font
+	monoBold       *opentype.Font
+	monoItalic     *opentype.Font
+	monoBoldItalic *opentype.Font
+
+	cache map[fontKey]font.Face
 }
 
 func newFontBank() fontBank {
 	bank := fontBank{cache: map[fontKey]font.Face{}}
-	reg, err := opentype.Parse(goregular.TTF)
-	if err != nil {
-		return bank
-	}
-	bol, err := opentype.Parse(gobold.TTF)
-	if err != nil {
-		return bank
-	}
-	ita, err := opentype.Parse(goitalic.TTF)
-	if err != nil {
-		return bank
-	}
-	bit, err := opentype.Parse(gobolditalic.TTF)
-	if err != nil {
-		return bank
-	}
-	bank.regular = reg
-	bank.bold = bol
-	bank.italic = ita
-	bank.boldItalic = bit
+
+	bank.sansRegular = parseFontBytes(fontSansRegular, goregular.TTF)
+	bank.sansBold = parseFontBytes(fontSansBold, gobold.TTF)
+	bank.sansItalic = parseFontBytes(fontSansItalic, goitalic.TTF)
+	bank.sansBoldItalic = parseFontBytes(fontSansBoldItalic, gobolditalic.TTF)
+
+	bank.serifRegular = parseFontBytes(fontSerifRegular, gomedium.TTF)
+	bank.serifBold = parseFontBytes(fontSerifBold, gomedium.TTF)
+	bank.serifItalic = parseFontBytes(fontSerifItalic, gomediumitalic.TTF)
+	bank.serifBoldItalic = parseFontBytes(fontSerifBoldItalic, gomediumitalic.TTF)
+
+	bank.monoRegular = parseFontBytes(fontMonoRegular, gomono.TTF)
+	bank.monoBold = parseFontBytes(fontMonoBold, gomonobold.TTF)
+	bank.monoItalic = parseFontBytes(fontMonoItalic, gomonoitalic.TTF)
+	bank.monoBoldItalic = parseFontBytes(fontMonoBoldItalic, gomonobolditalic.TTF)
+
 	return bank
+}
+
+func parseFontBytes(primary []byte, fallback []byte) *opentype.Font {
+	if len(primary) > 0 {
+		if f, err := opentype.Parse(primary); err == nil {
+			return f
+		}
+	}
+	if len(fallback) > 0 {
+		if f, err := opentype.Parse(fallback); err == nil {
+			return f
+		}
+	}
+	return nil
 }
 
 type App struct {
 	theme ui.Theme
 	state *editor.State
+
+	tabs      []documentTab
+	activeTab int
+	nextTabID int
 
 	frameBuffer *render.FrameBuffer
 	canvas      *ebiten.Image
@@ -156,6 +211,10 @@ type App struct {
 	maxHistory  int
 
 	topActions      []actionButton
+	tabActions      []actionButton
+	tabCloseActions []actionButton
+	tabAddAction    rect
+	tabBarRect      rect
 	toolbarActions  []actionButton
 	colorSwatches   []colorSwatch
 	colorPalette    []uint32
@@ -171,16 +230,31 @@ type App struct {
 	fontInputActive bool
 	fontInputBuffer string
 
+	showTabChooser bool
+	tabChooserRect rect
+	tabChoiceNew   rect
+	tabChoiceOpen  rect
+	tabChoiceClose rect
+
 	showEncryption        bool
 	encryptionPanel       rect
 	encryptionCloseRect   rect
 	encryptionEncRect     rect
 	encryptionCompRect    rect
 	encryptionPassRect    rect
+	encryptionPagedRect   rect
+	encryptionGapDownRect rect
+	encryptionGapUpRect   rect
+	encryptionFontSans    rect
+	encryptionFontSerif   rect
+	encryptionFontMono    rect
 	encryptionInputActive bool
 	encryptionEnabled     bool
 	compressionEnabled    bool
 	encryptionPassword    string
+	pagedMode             bool
+	paragraphGap          int
+	preferredFontFamily   sqdoc.FontFamily
 
 	showPasswordPrompt    bool
 	passwordPromptRect    rect
@@ -207,24 +281,36 @@ func New() *App {
 	doc := sqdoc.NewDocument("", "Untitled")
 	state := editor.NewState(doc)
 	_ = state.UpdateCurrentText("")
-	return &App{
-		theme:              ui.DefaultTheme(),
-		state:              state,
-		fonts:              newFontBank(),
-		uiScales:           []float32{1.0, 1.25, 1.5, 2.0},
-		filePath:           "",
-		status:             "Untitled document",
-		maxHistory:         200,
-		undoHistory:        make([]snapshot, 0, 64),
-		redoHistory:        make([]snapshot, 0, 64),
-		topActions:         make([]actionButton, 0, 16),
-		toolbarActions:     make([]actionButton, 0, 12),
-		colorSwatches:      make([]colorSwatch, 0, 16),
-		lineLayouts:        make([]lineLayout, 0, 128),
-		dataMapLabels:      make([]dataMapLabel, 0, 64),
-		colorPalette:       []uint32{0x202020FF, 0x0057B8FF, 0xA31515FF, 0x117A37FF, 0x7A2DB8FF, 0xE67E22FF, 0x8E44ADFF, 0x2C3E50FF, 0xB71C1CFF, 0x00695CFF, 0x455A64FF, 0x000000FF},
-		compressionEnabled: true,
+	app := &App{
+		theme:               ui.DefaultTheme(),
+		state:               state,
+		fonts:               newFontBank(),
+		uiScales:            []float32{1.0, 1.25, 1.5, 2.0},
+		filePath:            "",
+		status:              "Untitled document",
+		maxHistory:          200,
+		undoHistory:         make([]snapshot, 0, 64),
+		redoHistory:         make([]snapshot, 0, 64),
+		topActions:          make([]actionButton, 0, 16),
+		tabActions:          make([]actionButton, 0, 12),
+		tabCloseActions:     make([]actionButton, 0, 12),
+		toolbarActions:      make([]actionButton, 0, 12),
+		colorSwatches:       make([]colorSwatch, 0, 16),
+		lineLayouts:         make([]lineLayout, 0, 128),
+		dataMapLabels:       make([]dataMapLabel, 0, 64),
+		colorPalette:        []uint32{0x202020FF, 0x0057B8FF, 0xA31515FF, 0x117A37FF, 0x7A2DB8FF, 0xE67E22FF, 0x8E44ADFF, 0x2C3E50FF, 0xB71C1CFF, 0x00695CFF, 0x455A64FF, 0x000000FF},
+		compressionEnabled:  true,
+		pagedMode:           doc.Metadata.PagedMode,
+		paragraphGap:        int(doc.Metadata.ParagraphGap),
+		preferredFontFamily: doc.Metadata.PreferredFontFamily,
 	}
+	if app.paragraphGap <= 0 {
+		app.paragraphGap = 8
+	}
+	app.tabs = []documentTab{app.captureRuntimeAsTab()}
+	app.activeTab = 0
+	app.nextTabID = 2
+	return app
 }
 
 func (a *App) Run() error {
@@ -240,11 +326,17 @@ func (a *App) Run() error {
 }
 
 func (a *App) Update() error {
+	a.ensureTabs()
+	defer a.syncActiveTabFromRuntime()
+
 	a.frameTick++
 	ctrl := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
 	shift := ebiten.IsKeyPressed(ebiten.KeyShift)
 	alt := ebiten.IsKeyPressed(ebiten.KeyAlt)
 	winW, winH := a.currentViewportSize()
+	if a.showTabChooser {
+		a.layoutTabChooserBounds(winW, winH)
+	}
 	if a.showEncryption {
 		a.layoutEncryptionPanelBounds(winW, winH)
 	}
@@ -258,6 +350,10 @@ func (a *App) Update() error {
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 		if a.showPasswordPrompt {
 			a.closePasswordPrompt()
+			return nil
+		}
+		if a.showTabChooser {
+			a.showTabChooser = false
 			return nil
 		}
 		if a.showHelp {
@@ -293,6 +389,25 @@ func (a *App) Update() error {
 		a.showEncryption = !a.showEncryption
 		a.encryptionInputActive = a.showEncryption && a.encryptionEnabled
 	}
+	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyT) {
+		a.showTabChooser = true
+	}
+	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyTab) {
+		if shift {
+			a.switchTabRelative(-1)
+		} else {
+			a.switchTabRelative(1)
+		}
+		return nil
+	}
+	if a.showTabChooser {
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+			x, y := ebiten.CursorPosition()
+			a.handleTabChooserClick(x, y)
+		}
+		a.clampScroll()
+		return nil
+	}
 	if a.showHelp {
 		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
 			x, y := ebiten.CursorPosition()
@@ -310,12 +425,12 @@ func (a *App) Update() error {
 	}
 
 	wheelX, wheelY := ebiten.Wheel()
-	if shift && wheelY != 0 {
+	if shift && wheelY != 0 && !a.pagedMode {
 		a.scrollX -= wheelY * 48
 	} else if wheelY != 0 {
 		a.scrollY -= wheelY * 42
 	}
-	if wheelX != 0 {
+	if wheelX != 0 && !a.pagedMode {
 		a.scrollX -= wheelX * 48
 	}
 	a.clampScroll()
@@ -338,6 +453,9 @@ func (a *App) Update() error {
 			if a.handleEncryptionClick(x, y) {
 				return nil
 			}
+			return nil
+		}
+		if a.handleTabBarClick(x, y) {
 			return nil
 		}
 		if id, ok := a.actionAt(x, y); ok {
@@ -565,7 +683,7 @@ func (a *App) Update() error {
 		}
 	}
 
-	if ctrl || a.showEncryption || a.showPasswordPrompt {
+	if ctrl || a.showEncryption || a.showPasswordPrompt || a.showTabChooser {
 		a.clampScroll()
 		a.ensureCaretVisible()
 		return nil
@@ -752,6 +870,57 @@ func (a *App) handleEncryptionClick(x, y int) bool {
 		}
 		return true
 	}
+	if a.encryptionPagedRect.contains(x, y) {
+		a.pagedMode = !a.pagedMode
+		if a.pagedMode {
+			a.scrollX = 0
+			a.status = "Paged mode enabled"
+		} else {
+			a.status = "Paged mode disabled"
+		}
+		return true
+	}
+	if a.encryptionGapDownRect.contains(x, y) {
+		if a.paragraphGap > 0 {
+			a.paragraphGap--
+		}
+		a.status = fmt.Sprintf("Paragraph gap %d", a.paragraphGap)
+		return true
+	}
+	if a.encryptionGapUpRect.contains(x, y) {
+		if a.paragraphGap < 64 {
+			a.paragraphGap++
+		}
+		a.status = fmt.Sprintf("Paragraph gap %d", a.paragraphGap)
+		return true
+	}
+	if a.encryptionFontSans.contains(x, y) {
+		a.preferredFontFamily = sqdoc.FontFamilySans
+		if a.state != nil {
+			a.pushUndoSnapshot()
+			a.state.SetFontFamily(sqdoc.FontFamilySans)
+		}
+		a.status = "Font family: Sans Serif"
+		return true
+	}
+	if a.encryptionFontSerif.contains(x, y) {
+		a.preferredFontFamily = sqdoc.FontFamilySerif
+		if a.state != nil {
+			a.pushUndoSnapshot()
+			a.state.SetFontFamily(sqdoc.FontFamilySerif)
+		}
+		a.status = "Font family: Serif"
+		return true
+	}
+	if a.encryptionFontMono.contains(x, y) {
+		a.preferredFontFamily = sqdoc.FontFamilyMonospace
+		if a.state != nil {
+			a.pushUndoSnapshot()
+			a.state.SetFontFamily(sqdoc.FontFamilyMonospace)
+		}
+		a.status = "Font family: Monospace"
+		return true
+	}
 	a.encryptionInputActive = false
 	return true
 }
@@ -811,6 +980,7 @@ func (a *App) submitPasswordPrompt() {
 	a.redoHistory = a.redoHistory[:0]
 	a.encryptionPassword = a.passwordPromptInput
 	a.applyEnvelopeSettings(env)
+	a.applyDocumentMetadataSettings(doc.Metadata)
 	a.closePasswordPrompt()
 }
 
@@ -830,6 +1000,15 @@ func (a *App) applyEnvelopeSettings(info sqdoc.EnvelopeInfo) {
 	}
 	a.compressionEnabled = false
 	a.encryptionEnabled = false
+}
+
+func (a *App) applyDocumentMetadataSettings(meta sqdoc.Metadata) {
+	a.pagedMode = meta.PagedMode
+	a.paragraphGap = int(meta.ParagraphGap)
+	if a.paragraphGap <= 0 {
+		a.paragraphGap = 8
+	}
+	a.preferredFontFamily = normalizeFontFamilyApp(meta.PreferredFontFamily)
 }
 
 func (a *App) handleToolbarClick(x, y int) bool {
@@ -894,15 +1073,29 @@ func (a *App) invokeAction(id string) {
 	switch id {
 	case "new":
 		a.pushUndoSnapshot()
-		a.state = editor.NewState(sqdoc.NewDocument("", "Untitled"))
+		doc := sqdoc.NewDocument("", "Untitled")
+		doc.Metadata.PagedMode = a.pagedMode
+		doc.Metadata.ParagraphGap = uint16(max(0, a.paragraphGap))
+		doc.Metadata.PreferredFontFamily = normalizeFontFamilyApp(a.preferredFontFamily)
+		a.state = editor.NewState(doc)
+		_ = a.state.UpdateCurrentText("")
+		a.state.SetFontFamily(doc.Metadata.PreferredFontFamily)
 		a.filePath = ""
 		a.status = "New document"
 		a.scrollX, a.scrollY = 0, 0
+		a.maxX, a.maxY = 0, 0
+		a.undoHistory = a.undoHistory[:0]
+		a.redoHistory = a.redoHistory[:0]
 		a.showColorPicker = false
+		a.encryptionEnabled = false
+		a.compressionEnabled = true
+		a.encryptionPassword = ""
 	case "open":
 		if err := a.openDocumentDialog(); err != nil {
 			a.status = "Open failed: " + err.Error()
 		}
+	case "new_tab":
+		a.showTabChooser = true
 	case "save":
 		if err := a.saveDocument(false); err != nil {
 			a.status = "Save failed: " + err.Error()
@@ -973,6 +1166,21 @@ func (a *App) invokeAction(id string) {
 		a.fontInputBuffer = fmt.Sprintf("%d", a.state.CurrentStyleAttr().FontSizePt)
 	case "color_toggle":
 		a.showColorPicker = !a.showColorPicker
+	case "font_sans":
+		a.pushUndoSnapshot()
+		a.preferredFontFamily = sqdoc.FontFamilySans
+		a.state.SetFontFamily(sqdoc.FontFamilySans)
+		a.status = "Font family: Sans Serif"
+	case "font_serif":
+		a.pushUndoSnapshot()
+		a.preferredFontFamily = sqdoc.FontFamilySerif
+		a.state.SetFontFamily(sqdoc.FontFamilySerif)
+		a.status = "Font family: Serif"
+	case "font_mono":
+		a.pushUndoSnapshot()
+		a.preferredFontFamily = sqdoc.FontFamilyMonospace
+		a.state.SetFontFamily(sqdoc.FontFamilyMonospace)
+		a.status = "Font family: Monospace"
 	}
 }
 
@@ -984,12 +1192,13 @@ func (a *App) Draw(screen *ebiten.Image) {
 	}
 
 	layout := ui.DrawShell(a.frameBuffer, a.state, a.theme, a.uiScales[a.uiScaleIdx])
-	menuFace := a.uiFace(11, false, false)
-	toolbarFace := a.uiFace(11, false, false)
-	statusFace := a.uiFace(10, false, false)
-	panelFace := a.uiFace(9, false, false)
+	menuFace := a.uiFace(11, false, false, sqdoc.FontFamilySans)
+	toolbarFace := a.uiFace(11, false, false, sqdoc.FontFamilySans)
+	statusFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
+	panelFace := a.uiFace(9, false, false, sqdoc.FontFamilySans)
 
 	a.layoutTopActions(menuFace, layout)
+	a.layoutTabBar(menuFace, layout)
 	a.layoutToolbarControls(toolbarFace, layout)
 	a.layoutContentRects(layout)
 
@@ -1009,6 +1218,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 	screen.DrawImage(a.canvas, nil)
 
 	a.drawTopActionLabels(screen, menuFace)
+	a.drawTabLabels(screen, menuFace)
 	a.drawToolbarLabels(screen, toolbarFace)
 	a.drawDocumentText(screen)
 	a.drawDataMapLabels(screen, panelFace)
@@ -1032,6 +1242,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 	text.Draw(screen, statusRight, statusFace, 320, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
 
 	a.drawColorPickerOverlay(screen)
+	a.drawTabChooser(screen, w, h)
 	a.drawEncryptionPanel(screen, w, h)
 	a.drawEncryptionLabels(screen, toolbarFace)
 	a.drawPasswordPrompt(screen, w, h)
@@ -1042,7 +1253,15 @@ func (a *App) Draw(screen *ebiten.Image) {
 }
 
 func (a *App) layoutContentRects(layout ui.Layout) {
-	textBox := rect{x: layout.ContentX + 6, y: layout.ContentY + 24, w: layout.ContentW - 12, h: layout.ContentH - 28}
+	textBox := rect{x: layout.ContentX + 2, y: layout.ContentY + 20, w: layout.ContentW - 4, h: layout.ContentH - 22}
+	if a.shouldShowTabBar() {
+		barH := a.tabBarRect.h
+		if barH <= 0 {
+			barH = int(32 * a.uiScales[a.uiScaleIdx])
+		}
+		textBox.y += barH + 6
+		textBox.h -= barH + 6
+	}
 	if textBox.w < 360 {
 		textBox.w = 360
 	}
@@ -1130,13 +1349,20 @@ func (a *App) drawEncryptionLabels(screen *ebiten.Image, face font.Face) {
 	if !a.showEncryption {
 		return
 	}
-	titleFace := a.uiFace(12, true, false)
-	labelFace := a.uiFace(10, false, false)
-	text.Draw(screen, "Encryption View", titleFace, a.encryptionPanel.x+16, a.encryptionPanel.y+24, color.RGBA{R: 24, G: 38, B: 56, A: 255})
+	titleFace := a.uiFace(12, true, false, sqdoc.FontFamilySans)
+	labelFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
+	text.Draw(screen, "Document Settings", titleFace, a.encryptionPanel.x+16, a.encryptionPanel.y+24, color.RGBA{R: 24, G: 38, B: 56, A: 255})
 	text.Draw(screen, "Close", face, a.encryptionCloseRect.x+18, a.encryptionCloseRect.y+a.encryptionCloseRect.h-8, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "Compression (zlib)", labelFace, a.encryptionCompRect.x+28, a.encryptionCompRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "AES-256 password protection", labelFace, a.encryptionEncRect.x+28, a.encryptionEncRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 	text.Draw(screen, "Password", labelFace, a.encryptionPassRect.x, a.encryptionPassRect.y-6, color.RGBA{R: 52, G: 66, B: 92, A: 255})
+	text.Draw(screen, "Paged Modes", labelFace, a.encryptionPagedRect.x+28, a.encryptionPagedRect.y+14, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	text.Draw(screen, "Paragraph gap", labelFace, a.encryptionGapDownRect.x+24, a.encryptionGapDownRect.y+16, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	text.Draw(screen, fmt.Sprintf("%d", a.paragraphGap), labelFace, a.encryptionGapDownRect.x+240, a.encryptionGapDownRect.y+16, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	text.Draw(screen, "Default font family", labelFace, a.encryptionFontSans.x, a.encryptionFontSans.y-6, color.RGBA{R: 52, G: 66, B: 92, A: 255})
+	text.Draw(screen, "Sans Serif", labelFace, a.encryptionFontSans.x+18, a.encryptionFontSans.y+19, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	text.Draw(screen, "Serif", labelFace, a.encryptionFontSerif.x+34, a.encryptionFontSerif.y+19, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	text.Draw(screen, "Monospace", labelFace, a.encryptionFontMono.x+24, a.encryptionFontMono.y+19, color.RGBA{R: 42, G: 58, B: 82, A: 255})
 
 	masked := ""
 	if a.encryptionPassword != "" {
@@ -1148,13 +1374,13 @@ func (a *App) drawEncryptionLabels(screen *ebiten.Image, face font.Face) {
 		ebitenutil.DrawLine(screen, float64(caretX), float64(a.encryptionPassRect.y+7), float64(caretX), float64(a.encryptionPassRect.y+a.encryptionPassRect.h-7), color.RGBA{R: 21, G: 84, B: 164, A: 255})
 	}
 
-	hint := "Save/Open use these settings. For encrypted files, set password then open again."
+	hint := "Settings are per-document tab. Save writes paged mode + paragraph gap + preferred font."
 	text.Draw(screen, hint, labelFace, a.encryptionPanel.x+16, a.encryptionPanel.y+a.encryptionPanel.h-12, color.RGBA{R: 74, G: 88, B: 112, A: 255})
 }
 
 func (a *App) layoutEncryptionPanelBounds(w, h int) {
-	panelW := int(520 * a.uiScales[a.uiScaleIdx])
-	panelH := int(240 * a.uiScales[a.uiScaleIdx])
+	panelW := int(560 * a.uiScales[a.uiScaleIdx])
+	panelH := int(330 * a.uiScales[a.uiScaleIdx])
 	if panelW > w-40 {
 		panelW = w - 40
 	}
@@ -1166,8 +1392,14 @@ func (a *App) layoutEncryptionPanelBounds(w, h int) {
 	a.encryptionPanel = rect{x: px, y: py, w: panelW, h: panelH}
 	a.encryptionCloseRect = rect{x: px + panelW - 88, y: py + 10, w: 72, h: 26}
 	a.encryptionCompRect = rect{x: px + 20, y: py + 58, w: 18, h: 18}
-	a.encryptionEncRect = rect{x: px + 20, y: py + 92, w: 18, h: 18}
-	a.encryptionPassRect = rect{x: px + 20, y: py + 136, w: panelW - 40, h: 30}
+	a.encryptionEncRect = rect{x: px + 20, y: py + 90, w: 18, h: 18}
+	a.encryptionPassRect = rect{x: px + 20, y: py + 124, w: panelW - 40, h: 30}
+	a.encryptionPagedRect = rect{x: px + 20, y: py + 164, w: 18, h: 18}
+	a.encryptionGapDownRect = rect{x: px + 20, y: py + 198, w: 24, h: 24}
+	a.encryptionGapUpRect = rect{x: px + 120, y: py + 198, w: 24, h: 24}
+	a.encryptionFontSans = rect{x: px + 20, y: py + 238, w: 110, h: 28}
+	a.encryptionFontSerif = rect{x: px + 136, y: py + 238, w: 110, h: 28}
+	a.encryptionFontMono = rect{x: px + 252, y: py + 238, w: 130, h: 28}
 }
 
 func (a *App) drawEncryptionPanel(screen *ebiten.Image, w, h int) {
@@ -1191,6 +1423,7 @@ func (a *App) drawEncryptionPanel(screen *ebiten.Image, w, h int) {
 
 	a.drawCheckbox(screen, a.encryptionCompRect, a.compressionEnabled)
 	a.drawCheckbox(screen, a.encryptionEncRect, a.encryptionEnabled)
+	a.drawCheckbox(screen, a.encryptionPagedRect, a.pagedMode)
 
 	passBg := color.RGBA{R: 255, G: 255, B: 255, A: 255}
 	if a.encryptionInputActive {
@@ -1205,6 +1438,27 @@ func (a *App) drawEncryptionPanel(screen *ebiten.Image, w, h int) {
 	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), border)
 	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y), float64(a.encryptionPassRect.x), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), border)
 	ebitenutil.DrawLine(screen, float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y), float64(a.encryptionPassRect.x+a.encryptionPassRect.w), float64(a.encryptionPassRect.y+a.encryptionPassRect.h), border)
+
+	a.drawFilledRectOnScreen(screen, a.encryptionGapDownRect.x, a.encryptionGapDownRect.y, a.encryptionGapDownRect.w, a.encryptionGapDownRect.h, color.RGBA{R: 237, G: 242, B: 248, A: 255})
+	a.drawFilledRectOnScreen(screen, a.encryptionGapUpRect.x, a.encryptionGapUpRect.y, a.encryptionGapUpRect.w, a.encryptionGapUpRect.h, color.RGBA{R: 237, G: 242, B: 248, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionGapDownRect.x), float64(a.encryptionGapDownRect.y+a.encryptionGapDownRect.h/2), float64(a.encryptionGapDownRect.x+a.encryptionGapDownRect.w), float64(a.encryptionGapDownRect.y+a.encryptionGapDownRect.h/2), color.RGBA{R: 52, G: 68, B: 92, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionGapUpRect.x), float64(a.encryptionGapUpRect.y+a.encryptionGapUpRect.h/2), float64(a.encryptionGapUpRect.x+a.encryptionGapUpRect.w), float64(a.encryptionGapUpRect.y+a.encryptionGapUpRect.h/2), color.RGBA{R: 52, G: 68, B: 92, A: 255})
+	ebitenutil.DrawLine(screen, float64(a.encryptionGapUpRect.x+a.encryptionGapUpRect.w/2), float64(a.encryptionGapUpRect.y+4), float64(a.encryptionGapUpRect.x+a.encryptionGapUpRect.w/2), float64(a.encryptionGapUpRect.y+a.encryptionGapUpRect.h-4), color.RGBA{R: 52, G: 68, B: 92, A: 255})
+
+	drawFamily := func(r rect, active bool) {
+		bg := color.RGBA{R: 236, G: 241, B: 248, A: 255}
+		if active {
+			bg = color.RGBA{R: 213, G: 228, B: 247, A: 255}
+		}
+		a.drawFilledRectOnScreen(screen, r.x, r.y, r.w, r.h, bg)
+		ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x+r.w), float64(r.y), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+		ebitenutil.DrawLine(screen, float64(r.x), float64(r.y+r.h), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+		ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+		ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	}
+	drawFamily(a.encryptionFontSans, a.preferredFontFamily == sqdoc.FontFamilySans)
+	drawFamily(a.encryptionFontSerif, a.preferredFontFamily == sqdoc.FontFamilySerif)
+	drawFamily(a.encryptionFontMono, a.preferredFontFamily == sqdoc.FontFamilyMonospace)
 }
 
 func (a *App) drawCheckbox(screen *ebiten.Image, r rect, checked bool) {
@@ -1311,6 +1565,487 @@ func (a *App) currentViewportSize() (int, int) {
 	return w, h
 }
 
+func (a *App) ensureTabs() {
+	if len(a.tabs) > 0 {
+		if a.activeTab < 0 {
+			a.activeTab = 0
+		}
+		if a.activeTab >= len(a.tabs) {
+			a.activeTab = len(a.tabs) - 1
+		}
+		return
+	}
+	a.tabs = []documentTab{a.captureRuntimeAsTab()}
+	a.activeTab = 0
+	if a.nextTabID <= 0 {
+		a.nextTabID = 2
+	}
+}
+
+func (a *App) captureRuntimeAsTab() documentTab {
+	tab := documentTab{
+		id:                  a.nextTabID,
+		state:               a.state,
+		filePath:            a.filePath,
+		undoHistory:         append([]snapshot(nil), a.undoHistory...),
+		redoHistory:         append([]snapshot(nil), a.redoHistory...),
+		scrollX:             a.scrollX,
+		scrollY:             a.scrollY,
+		maxX:                a.maxX,
+		maxY:                a.maxY,
+		encryptionEnabled:   a.encryptionEnabled,
+		compressionEnabled:  a.compressionEnabled,
+		encryptionPassword:  a.encryptionPassword,
+		pagedMode:           a.pagedMode,
+		paragraphGap:        a.paragraphGap,
+		preferredFontFamily: normalizeFontFamilyApp(a.preferredFontFamily),
+	}
+	if tab.state == nil {
+		doc := sqdoc.NewDocument("", "Untitled")
+		tab.state = editor.NewState(doc)
+		_ = tab.state.UpdateCurrentText("")
+	}
+	if tab.paragraphGap <= 0 {
+		tab.paragraphGap = 8
+	}
+	if tab.id <= 0 {
+		tab.id = 1
+	}
+	return tab
+}
+
+func (a *App) syncActiveTabFromRuntime() {
+	if len(a.tabs) == 0 || a.activeTab < 0 || a.activeTab >= len(a.tabs) {
+		return
+	}
+	tab := &a.tabs[a.activeTab]
+	tab.state = a.state
+	tab.filePath = a.filePath
+	tab.undoHistory = append(tab.undoHistory[:0], a.undoHistory...)
+	tab.redoHistory = append(tab.redoHistory[:0], a.redoHistory...)
+	tab.scrollX = a.scrollX
+	tab.scrollY = a.scrollY
+	tab.maxX = a.maxX
+	tab.maxY = a.maxY
+	tab.encryptionEnabled = a.encryptionEnabled
+	tab.compressionEnabled = a.compressionEnabled
+	tab.encryptionPassword = a.encryptionPassword
+	tab.pagedMode = a.pagedMode
+	tab.paragraphGap = a.paragraphGap
+	tab.preferredFontFamily = normalizeFontFamilyApp(a.preferredFontFamily)
+}
+
+func (a *App) restoreRuntimeFromTab(idx int) {
+	if idx < 0 || idx >= len(a.tabs) {
+		return
+	}
+	tab := a.tabs[idx]
+	a.state = tab.state
+	a.filePath = tab.filePath
+	a.undoHistory = append([]snapshot(nil), tab.undoHistory...)
+	a.redoHistory = append([]snapshot(nil), tab.redoHistory...)
+	a.scrollX = tab.scrollX
+	a.scrollY = tab.scrollY
+	a.maxX = tab.maxX
+	a.maxY = tab.maxY
+	a.encryptionEnabled = tab.encryptionEnabled
+	a.compressionEnabled = tab.compressionEnabled
+	a.encryptionPassword = tab.encryptionPassword
+	a.pagedMode = tab.pagedMode
+	a.paragraphGap = tab.paragraphGap
+	if a.paragraphGap <= 0 {
+		a.paragraphGap = 8
+	}
+	a.preferredFontFamily = normalizeFontFamilyApp(tab.preferredFontFamily)
+	if a.state == nil {
+		doc := sqdoc.NewDocument("", "Untitled")
+		a.state = editor.NewState(doc)
+		_ = a.state.UpdateCurrentText("")
+	}
+}
+
+func (a *App) switchTab(index int) {
+	if index < 0 || index >= len(a.tabs) || index == a.activeTab {
+		return
+	}
+	a.syncActiveTabFromRuntime()
+	a.activeTab = index
+	a.restoreRuntimeFromTab(index)
+	a.showColorPicker = false
+	a.showEncryption = false
+	a.encryptionInputActive = false
+	a.showPasswordPrompt = false
+	a.showTabChooser = false
+	a.fontInputActive = false
+	a.dragSelecting = false
+	a.status = "Switched to " + a.tabTitle(index)
+}
+
+func (a *App) switchTabRelative(delta int) {
+	if len(a.tabs) <= 1 || delta == 0 {
+		return
+	}
+	next := a.activeTab + delta
+	for next < 0 {
+		next += len(a.tabs)
+	}
+	next %= len(a.tabs)
+	a.switchTab(next)
+}
+
+func (a *App) closeTab(index int) {
+	if index < 0 || index >= len(a.tabs) {
+		return
+	}
+	a.syncActiveTabFromRuntime()
+	if len(a.tabs) == 1 {
+		doc := sqdoc.NewDocument("", "Untitled")
+		doc.Metadata.PagedMode = a.pagedMode
+		doc.Metadata.ParagraphGap = uint16(max(0, a.paragraphGap))
+		doc.Metadata.PreferredFontFamily = normalizeFontFamilyApp(a.preferredFontFamily)
+		a.tabs[0] = documentTab{
+			id:                  a.tabs[0].id,
+			state:               editor.NewState(doc),
+			filePath:            "",
+			undoHistory:         make([]snapshot, 0, 64),
+			redoHistory:         make([]snapshot, 0, 64),
+			scrollX:             0,
+			scrollY:             0,
+			maxX:                0,
+			maxY:                0,
+			encryptionEnabled:   false,
+			compressionEnabled:  true,
+			encryptionPassword:  "",
+			pagedMode:           doc.Metadata.PagedMode,
+			paragraphGap:        int(doc.Metadata.ParagraphGap),
+			preferredFontFamily: doc.Metadata.PreferredFontFamily,
+		}
+		a.restoreRuntimeFromTab(0)
+		a.status = "Tab reset to new document"
+		return
+	}
+
+	wasActive := index == a.activeTab
+	a.tabs = append(a.tabs[:index], a.tabs[index+1:]...)
+	if a.activeTab > index {
+		a.activeTab--
+	} else if wasActive {
+		if index >= len(a.tabs) {
+			a.activeTab = len(a.tabs) - 1
+		} else {
+			a.activeTab = index
+		}
+	}
+	if a.activeTab < 0 {
+		a.activeTab = 0
+	}
+	a.restoreRuntimeFromTab(a.activeTab)
+	a.status = "Tab closed"
+}
+
+func (a *App) createNewTabState() *editor.State {
+	doc := sqdoc.NewDocument("", "Untitled")
+	doc.Metadata.PagedMode = a.pagedMode
+	doc.Metadata.ParagraphGap = uint16(max(0, a.paragraphGap))
+	doc.Metadata.PreferredFontFamily = normalizeFontFamilyApp(a.preferredFontFamily)
+	state := editor.NewState(doc)
+	_ = state.UpdateCurrentText("")
+	state.SetFontFamily(doc.Metadata.PreferredFontFamily)
+	return state
+}
+
+func (a *App) appendTab(state *editor.State, filePath string) int {
+	if state == nil {
+		state = a.createNewTabState()
+	}
+	gap := 8
+	paged := false
+	preferred := sqdoc.FontFamilySans
+	if state.Doc != nil {
+		paged = state.Doc.Metadata.PagedMode
+		gap = int(state.Doc.Metadata.ParagraphGap)
+		preferred = normalizeFontFamilyApp(state.Doc.Metadata.PreferredFontFamily)
+	}
+	if gap <= 0 {
+		gap = 8
+	}
+	tabID := a.nextTabID
+	if tabID <= 0 {
+		tabID = len(a.tabs) + 1
+	}
+	tab := documentTab{
+		id:                  tabID,
+		state:               state,
+		filePath:            filePath,
+		undoHistory:         make([]snapshot, 0, 64),
+		redoHistory:         make([]snapshot, 0, 64),
+		scrollX:             0,
+		scrollY:             0,
+		maxX:                0,
+		maxY:                0,
+		encryptionEnabled:   false,
+		compressionEnabled:  true,
+		encryptionPassword:  "",
+		pagedMode:           paged,
+		paragraphGap:        gap,
+		preferredFontFamily: preferred,
+	}
+	a.tabs = append(a.tabs, tab)
+	a.nextTabID = tabID + 1
+	return len(a.tabs) - 1
+}
+
+func (a *App) shouldShowTabBar() bool {
+	return len(a.tabs) > 1 || a.showTabChooser
+}
+
+func (a *App) tabTitle(index int) string {
+	if index < 0 || index >= len(a.tabs) {
+		return "Untitled"
+	}
+	tab := a.tabs[index]
+	if tab.filePath != "" {
+		return filepath.Base(tab.filePath)
+	}
+	if tab.state != nil && tab.state.Doc != nil {
+		title := strings.TrimSpace(tab.state.Doc.Metadata.Title)
+		if title != "" && !strings.EqualFold(title, "Untitled") {
+			return title
+		}
+	}
+	return fmt.Sprintf("Untitled %d", tab.id)
+}
+
+func (a *App) layoutTabBar(face font.Face, layout ui.Layout) {
+	a.tabActions = a.tabActions[:0]
+	a.tabCloseActions = a.tabCloseActions[:0]
+	a.tabAddAction = rect{}
+	a.tabBarRect = rect{}
+	if !a.shouldShowTabBar() {
+		return
+	}
+	barX := layout.ContentX + 6
+	barY := layout.ContentY + 2
+	barW := layout.ContentW - 12
+	barH := int(32 * a.uiScales[a.uiScaleIdx])
+	if barH < 24 {
+		barH = 24
+	}
+	a.tabBarRect = rect{x: barX, y: barY, w: barW, h: barH}
+	a.frameBuffer.FillRect(barX, barY, barW, barH, color.RGBA{R: 237, G: 242, B: 249, A: 255})
+	a.frameBuffer.StrokeRect(barX, barY, barW, barH, 1, color.RGBA{R: 186, G: 198, B: 215, A: 255})
+
+	x := barX + 6
+	y := barY + 4
+	h := barH - 8
+	mx, my := ebiten.CursorPosition()
+	for i := range a.tabs {
+		label := a.tabTitle(i)
+		tw := a.measureString(face, label)
+		w := tw + 42
+		if w < 92 {
+			w = 92
+		}
+		if w > 252 {
+			w = 252
+		}
+		if x+w > barX+barW-34 {
+			break
+		}
+		r := rect{x: x, y: y, w: w, h: h}
+		closeRect := rect{x: r.x + r.w - 20, y: r.y + (r.h-14)/2, w: 14, h: 14}
+		bg := color.RGBA{R: 226, G: 233, B: 245, A: 255}
+		if i == a.activeTab {
+			bg = color.RGBA{R: 251, G: 253, B: 255, A: 255}
+		}
+		if r.contains(mx, my) {
+			bg = color.RGBA{R: 212, G: 225, B: 244, A: 255}
+		}
+		a.frameBuffer.FillRect(r.x, r.y, r.w, r.h, bg)
+		a.frameBuffer.StrokeRect(r.x, r.y, r.w, r.h, 1, color.RGBA{R: 168, G: 183, B: 205, A: 255})
+		if i == a.activeTab {
+			a.frameBuffer.StrokeRect(r.x+1, r.y+1, r.w-2, r.h-2, 1, color.RGBA{R: 120, G: 152, B: 194, A: 255})
+			a.frameBuffer.FillRect(r.x+1, r.y, r.w-2, 2, color.RGBA{R: 57, G: 104, B: 176, A: 255})
+		}
+		closeBg := color.RGBA{R: 227, G: 234, B: 246, A: 255}
+		if closeRect.contains(mx, my) {
+			closeBg = color.RGBA{R: 214, G: 83, B: 83, A: 255}
+		}
+		a.frameBuffer.FillRect(closeRect.x, closeRect.y, closeRect.w, closeRect.h, closeBg)
+		a.frameBuffer.StrokeRect(closeRect.x, closeRect.y, closeRect.w, closeRect.h, 1, color.RGBA{R: 156, G: 172, B: 196, A: 255})
+		a.tabActions = append(a.tabActions, actionButton{id: fmt.Sprintf("tab:%d", i), label: label, r: r, active: i == a.activeTab})
+		a.tabCloseActions = append(a.tabCloseActions, actionButton{id: fmt.Sprintf("tab_close:%d", i), label: "x", r: closeRect, active: false})
+		x += w + 4
+	}
+	a.tabAddAction = rect{x: barX + barW - 28, y: y, w: 20, h: h}
+	plusBg := color.RGBA{R: 231, G: 238, B: 249, A: 255}
+	if a.tabAddAction.contains(mx, my) {
+		plusBg = color.RGBA{R: 214, G: 227, B: 245, A: 255}
+	}
+	a.frameBuffer.FillRect(a.tabAddAction.x, a.tabAddAction.y, a.tabAddAction.w, a.tabAddAction.h, plusBg)
+	a.frameBuffer.StrokeRect(a.tabAddAction.x, a.tabAddAction.y, a.tabAddAction.w, a.tabAddAction.h, 1, color.RGBA{R: 168, G: 183, B: 205, A: 255})
+}
+
+func (a *App) drawTabLabels(screen *ebiten.Image, face font.Face) {
+	if !a.shouldShowTabBar() {
+		return
+	}
+	mx, my := ebiten.CursorPosition()
+	for _, tab := range a.tabActions {
+		clr := color.RGBA{R: 54, G: 68, B: 92, A: 255}
+		if tab.active {
+			clr = color.RGBA{R: 24, G: 38, B: 56, A: 255}
+		}
+		label := tab.label
+		maxChars := 22
+		if utf8.RuneCountInString(label) > maxChars {
+			rs := []rune(label)
+			label = string(rs[:maxChars-1]) + "..."
+		}
+		tw := a.measureString(face, label)
+		ascent := face.Metrics().Ascent.Round()
+		descent := face.Metrics().Descent.Round()
+		textHeight := ascent + descent
+		availableW := tab.r.w - 26
+		x := tab.r.x + 8
+		if tw < availableW {
+			x = tab.r.x + 8 + (availableW-tw)/2
+		}
+		baseline := tab.r.y + (tab.r.h+textHeight)/2 - descent
+		text.Draw(screen, label, face, x, baseline, clr)
+	}
+	for _, closeBtn := range a.tabCloseActions {
+		c := color.RGBA{R: 56, G: 72, B: 95, A: 255}
+		if closeBtn.r.contains(mx, my) {
+			c = color.RGBA{R: 255, G: 255, B: 255, A: 255}
+		}
+		x1 := float64(closeBtn.r.x + 3)
+		y1 := float64(closeBtn.r.y + 3)
+		x2 := float64(closeBtn.r.x + closeBtn.r.w - 3)
+		y2 := float64(closeBtn.r.y + closeBtn.r.h - 3)
+		ebitenutil.DrawLine(screen, x1, y1, x2, y2, c)
+		ebitenutil.DrawLine(screen, x1, y2, x2, y1, c)
+	}
+	if a.tabAddAction.w > 0 {
+		c := color.RGBA{R: 52, G: 68, B: 92, A: 255}
+		cx := a.tabAddAction.x + a.tabAddAction.w/2
+		cy := a.tabAddAction.y + a.tabAddAction.h/2
+		ebitenutil.DrawLine(screen, float64(cx-5), float64(cy), float64(cx+5), float64(cy), c)
+		ebitenutil.DrawLine(screen, float64(cx), float64(cy-5), float64(cx), float64(cy+5), c)
+	}
+}
+
+func (a *App) handleTabBarClick(x, y int) bool {
+	if !a.shouldShowTabBar() || !a.tabBarRect.contains(x, y) {
+		return false
+	}
+	for _, closeBtn := range a.tabCloseActions {
+		if !closeBtn.r.contains(x, y) {
+			continue
+		}
+		if strings.HasPrefix(closeBtn.id, "tab_close:") {
+			idx, err := strconv.Atoi(strings.TrimPrefix(closeBtn.id, "tab_close:"))
+			if err == nil {
+				a.closeTab(idx)
+			}
+		}
+		return true
+	}
+	if a.tabAddAction.contains(x, y) {
+		a.showTabChooser = true
+		return true
+	}
+	for _, tab := range a.tabActions {
+		if !tab.r.contains(x, y) {
+			continue
+		}
+		if strings.HasPrefix(tab.id, "tab:") {
+			idx, err := strconv.Atoi(strings.TrimPrefix(tab.id, "tab:"))
+			if err == nil {
+				a.switchTab(idx)
+			}
+		}
+		return true
+	}
+	return true
+}
+func (a *App) layoutTabChooserBounds(w, h int) {
+	pw := int(360 * a.uiScales[a.uiScaleIdx])
+	ph := int(172 * a.uiScales[a.uiScaleIdx])
+	if pw > w-40 {
+		pw = w - 40
+	}
+	if ph > h-40 {
+		ph = h - 40
+	}
+	px := (w - pw) / 2
+	py := (h - ph) / 2
+	a.tabChooserRect = rect{x: px, y: py, w: pw, h: ph}
+	a.tabChoiceNew = rect{x: px + 20, y: py + 66, w: pw - 40, h: 30}
+	a.tabChoiceOpen = rect{x: px + 20, y: py + 102, w: pw - 40, h: 30}
+	a.tabChoiceClose = rect{x: px + pw - 96, y: py + 12, w: 76, h: 26}
+}
+
+func (a *App) drawTabChooser(screen *ebiten.Image, w, h int) {
+	if !a.showTabChooser {
+		return
+	}
+	a.layoutTabChooserBounds(w, h)
+	a.drawFilledRectOnScreen(screen, 0, 0, w, h, color.RGBA{R: 0, G: 0, B: 0, A: 82})
+	r := a.tabChooserRect
+	a.drawFilledRectOnScreen(screen, r.x, r.y, r.w, r.h, color.RGBA{R: 249, G: 251, B: 254, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x+r.w), float64(r.y), color.RGBA{R: 164, G: 180, B: 201, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y+r.h), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 164, G: 180, B: 201, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 164, G: 180, B: 201, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 164, G: 180, B: 201, A: 255})
+
+	titleFace := a.uiFace(12, true, false, sqdoc.FontFamilySans)
+	labelFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
+	text.Draw(screen, "Open New Tab", titleFace, r.x+20, r.y+30, color.RGBA{R: 28, G: 42, B: 60, A: 255})
+
+	drawBtn := func(rr rect, label string) {
+		a.drawFilledRectOnScreen(screen, rr.x, rr.y, rr.w, rr.h, color.RGBA{R: 232, G: 239, B: 249, A: 255})
+		ebitenutil.DrawLine(screen, float64(rr.x), float64(rr.y), float64(rr.x+rr.w), float64(rr.y), color.RGBA{R: 171, G: 186, B: 208, A: 255})
+		ebitenutil.DrawLine(screen, float64(rr.x), float64(rr.y+rr.h), float64(rr.x+rr.w), float64(rr.y+rr.h), color.RGBA{R: 171, G: 186, B: 208, A: 255})
+		ebitenutil.DrawLine(screen, float64(rr.x), float64(rr.y), float64(rr.x), float64(rr.y+rr.h), color.RGBA{R: 171, G: 186, B: 208, A: 255})
+		ebitenutil.DrawLine(screen, float64(rr.x+rr.w), float64(rr.y), float64(rr.x+rr.w), float64(rr.y+rr.h), color.RGBA{R: 171, G: 186, B: 208, A: 255})
+		text.Draw(screen, label, labelFace, rr.x+12, rr.y+20, color.RGBA{R: 46, G: 62, B: 88, A: 255})
+	}
+	drawBtn(a.tabChoiceNew, "Create New Document")
+	drawBtn(a.tabChoiceOpen, "Open Existing Document")
+	drawBtn(a.tabChoiceClose, "Close")
+}
+
+func (a *App) handleTabChooserClick(x, y int) {
+	if !a.showTabChooser {
+		return
+	}
+	if !a.tabChooserRect.contains(x, y) || a.tabChoiceClose.contains(x, y) {
+		a.showTabChooser = false
+		return
+	}
+	if a.tabChoiceNew.contains(x, y) {
+		a.syncActiveTabFromRuntime()
+		idx := a.appendTab(a.createNewTabState(), "")
+		a.switchTab(idx)
+		a.showTabChooser = false
+		a.status = "New tab created"
+		return
+	}
+	if a.tabChoiceOpen.contains(x, y) {
+		a.syncActiveTabFromRuntime()
+		idx := a.appendTab(a.createNewTabState(), "")
+		a.switchTab(idx)
+		a.showTabChooser = false
+		if err := a.openDocumentDialog(); err != nil {
+			if !errors.Is(err, dialog.ErrCancelled) {
+				a.status = "Open failed: " + err.Error()
+			}
+		}
+		return
+	}
+}
+
 func (a *App) layoutTopActions(face font.Face, layout ui.Layout) {
 	a.topActions = a.topActions[:0]
 	x := 10
@@ -1321,13 +2056,14 @@ func (a *App) layoutTopActions(face font.Face, layout ui.Layout) {
 	}
 	buttons := []actionButton{
 		{id: "new", label: "New"},
+		{id: "new_tab", label: "New Tab"},
 		{id: "open", label: "Open"},
 		{id: "save", label: "Save"},
 		{id: "save_as", label: "Save As"},
 		{id: "undo", label: "Undo"},
 		{id: "redo", label: "Redo"},
 		{id: "data_map", label: "Data Map", active: a.showDataMap},
-		{id: "encryption", label: "Encryption", active: a.showEncryption},
+		{id: "encryption", label: "Doc Settings", active: a.showEncryption},
 		{id: "scale_down", label: "A-"},
 		{id: "scale_up", label: "A+"},
 		{id: "help", label: "Help", active: a.showHelp},
@@ -1412,6 +2148,12 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 	colorRect := addBtn("color_toggle", "Color", 68, false)
 	a.frameBuffer.FillRect(colorRect.x+colorRect.w-14, colorRect.y+6, 8, colorRect.h-12, rgbaFromUint32(attr.ColorRGBA))
 	a.frameBuffer.StrokeRect(colorRect.x+colorRect.w-14, colorRect.y+6, 8, colorRect.h-12, 1, color.RGBA{R: 88, G: 102, B: 122, A: 255})
+	x += 4
+
+	fam := normalizeFontFamilyApp(attr.FontFamily)
+	addBtn("font_sans", "Sans", 60, fam == sqdoc.FontFamilySans)
+	addBtn("font_serif", "Serif", 62, fam == sqdoc.FontFamilySerif)
+	addBtn("font_mono", "Mono", 60, fam == sqdoc.FontFamilyMonospace)
 
 	if a.showColorPicker {
 		popupW := 184
@@ -1449,22 +2191,51 @@ func (a *App) measureString(face font.Face, s string) int {
 }
 
 // uiFace returns a cached face for the UI, scaling by current UI scale.
-func (a *App) uiFace(size int, bold, italic bool) font.Face {
+func (a *App) uiFace(size int, bold, italic bool, family sqdoc.FontFamily) font.Face {
+	family = normalizeFontFamilyApp(family)
 	scaleKey := int(math.Round(float64(a.uiScales[a.uiScaleIdx] * 1000)))
-	key := fontKey{size: size, bold: bold, italic: italic, scale: scaleKey}
+	key := fontKey{family: family, size: size, bold: bold, italic: italic, scale: scaleKey}
 	if f, ok := a.fonts.cache[key]; ok {
 		return f
 	}
 	var base *opentype.Font
-	switch {
-	case bold && italic:
-		base = a.fonts.boldItalic
-	case bold:
-		base = a.fonts.bold
-	case italic:
-		base = a.fonts.italic
+	switch family {
+	case sqdoc.FontFamilyMonospace:
+		switch {
+		case bold && italic:
+			base = a.fonts.monoBoldItalic
+		case bold:
+			base = a.fonts.monoBold
+		case italic:
+			base = a.fonts.monoItalic
+		default:
+			base = a.fonts.monoRegular
+		}
+	case sqdoc.FontFamilySerif:
+		switch {
+		case bold && italic:
+			base = a.fonts.serifBoldItalic
+		case bold:
+			base = a.fonts.serifBold
+		case italic:
+			base = a.fonts.serifItalic
+		default:
+			base = a.fonts.serifRegular
+		}
 	default:
-		base = a.fonts.regular
+		switch {
+		case bold && italic:
+			base = a.fonts.sansBoldItalic
+		case bold:
+			base = a.fonts.sansBold
+		case italic:
+			base = a.fonts.sansItalic
+		default:
+			base = a.fonts.sansRegular
+		}
+	}
+	if base == nil {
+		base = a.fonts.sansRegular
 	}
 	if base == nil {
 		return basicfont.Face7x13
@@ -1489,123 +2260,143 @@ func (a *App) layoutDocumentLines() {
 	if lineGap < 2 {
 		lineGap = 2
 	}
-	blockGap := int(8 * a.uiScales[a.uiScaleIdx])
-	if blockGap < 6 {
-		blockGap = 6
+	blockGap := int(float32(max(0, a.paragraphGap)) * a.uiScales[a.uiScaleIdx])
+	if blockGap < 0 {
+		blockGap = 0
 	}
 	maxWidth := 0
+	wrapWidth := a.contentRect.w - 18
+	if wrapWidth < 80 {
+		wrapWidth = 80
+	}
+	allTexts := a.state.AllBlockTexts()
 
 	for bi := 0; bi < a.state.BlockCount(); bi++ {
-		textBytes := []byte(a.state.AllBlockTexts()[bi])
+		textBytes := []byte(allTexts[bi])
 		runs := a.state.BlockRuns(bi)
 		if len(runs) == 0 {
 			runs = []sqdoc.StyleRun{{Start: 0, End: uint32(len(textBytes)), Attr: defaultAttr()}}
 		}
 
-		lineStart := 0
+		logicalStart := 0
 		for {
-			relEnd := bytes.IndexByte(textBytes[lineStart:], '\n')
-			lineEnd := len(textBytes)
+			relEnd := bytes.IndexByte(textBytes[logicalStart:], '\n')
+			logicalEnd := len(textBytes)
 			hasNL := false
 			if relEnd >= 0 {
-				lineEnd = lineStart + relEnd
+				logicalEnd = logicalStart + relEnd
 				hasNL = true
 			}
 
-			lineBytes := append([]byte(nil), textBytes[lineStart:lineEnd]...)
-			lineLen := len(lineBytes)
-			segments := make([]lineSegment, 0, len(runs))
-			lineWidth := 0
-			maxAscent := 0
-			maxDescent := 0
+			wrapStart := logicalStart
+			for {
+				lineEnd := logicalEnd
+				if a.pagedMode && wrapStart < logicalEnd {
+					lineEnd = a.wrapSegmentEnd(textBytes, runs, wrapStart, logicalEnd, wrapWidth)
+				}
+				if lineEnd <= wrapStart && wrapStart < logicalEnd {
+					lineEnd = nextRuneBoundary(textBytes, wrapStart)
+				}
+				lineBytes := append([]byte(nil), textBytes[wrapStart:lineEnd]...)
+				lineLen := len(lineBytes)
+				segments := make([]lineSegment, 0, len(runs))
+				lineWidth := 0
+				maxAscent := 0
+				maxDescent := 0
 
-			for _, run := range runs {
-				rs := int(run.Start)
-				re := int(run.End)
-				if re <= lineStart || rs >= lineEnd {
-					continue
+				for _, run := range runs {
+					rs := int(run.Start)
+					re := int(run.End)
+					if re <= wrapStart || rs >= lineEnd {
+						continue
+					}
+					segStart := max(rs, wrapStart) - wrapStart
+					segEnd := min(re, lineEnd) - wrapStart
+					if segEnd < segStart {
+						continue
+					}
+					attr := normalizeStyleAttr(run.Attr, a.preferredFontFamily)
+					face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic, attr.FontFamily)
+					segText := ""
+					if segStart < segEnd && segEnd <= lineLen {
+						segText = string(lineBytes[segStart:segEnd])
+					}
+					segW := a.measureString(face, segText)
+					m := face.Metrics()
+					if asc := m.Ascent.Round(); asc > maxAscent {
+						maxAscent = asc
+					}
+					if des := m.Descent.Round(); des > maxDescent {
+						maxDescent = des
+					}
+					segments = append(segments, lineSegment{
+						start: segStart,
+						end:   segEnd,
+						text:  segText,
+						attr:  attr,
+						face:  face,
+						width: segW,
+					})
+					lineWidth += segW
 				}
-				segStart := max(rs, lineStart) - lineStart
-				segEnd := min(re, lineEnd) - lineStart
-				if segEnd < segStart {
-					continue
+
+				if len(segments) == 0 {
+					attr := normalizeStyleAttr(defaultAttr(), a.preferredFontFamily)
+					if len(runs) > 0 {
+						attr = normalizeStyleAttr(runs[0].Attr, a.preferredFontFamily)
+					}
+					face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic, attr.FontFamily)
+					m := face.Metrics()
+					maxAscent = m.Ascent.Round()
+					maxDescent = m.Descent.Round()
+					segments = append(segments, lineSegment{
+						start: 0,
+						end:   lineLen,
+						text:  string(lineBytes),
+						attr:  attr,
+						face:  face,
+						width: a.measureString(face, string(lineBytes)),
+					})
+					lineWidth = segments[0].width
 				}
-				attr := run.Attr
-				if attr.FontSizePt == 0 {
-					attr.FontSizePt = 14
+
+				height := maxAscent + maxDescent + int(6*a.uiScales[a.uiScaleIdx])
+				if height < 18 {
+					height = 18
 				}
-				if attr.ColorRGBA == 0 {
-					attr.ColorRGBA = 0x202020FF
-				}
-				face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic)
-				segText := ""
-				if segStart < segEnd && segEnd <= lineLen {
-					segText = string(lineBytes[segStart:segEnd])
-				}
-				segW := a.measureString(face, segText)
-				m := face.Metrics()
-				if asc := m.Ascent.Round(); asc > maxAscent {
-					maxAscent = asc
-				}
-				if des := m.Descent.Round(); des > maxDescent {
-					maxDescent = des
-				}
-				segments = append(segments, lineSegment{
-					start: segStart,
-					end:   segEnd,
-					text:  segText,
-					attr:  attr,
-					face:  face,
-					width: segW,
+				a.lineLayouts = append(a.lineLayouts, lineLayout{
+					block:     bi,
+					startByte: wrapStart,
+					text:      lineBytes,
+					segments:  segments,
+					docX:      8,
+					docY:      docY,
+					height:    height,
+					ascent:    maxAscent,
+					width:     lineWidth,
 				})
-				lineWidth += segW
-			}
 
-			if len(segments) == 0 {
-				attr := defaultAttr()
-				if len(runs) > 0 {
-					attr = runs[0].Attr
+				if 8+lineWidth > maxWidth {
+					maxWidth = 8 + lineWidth
 				}
-				face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic)
-				m := face.Metrics()
-				maxAscent = m.Ascent.Round()
-				maxDescent = m.Descent.Round()
-				segments = append(segments, lineSegment{
-					start: 0,
-					end:   lineLen,
-					text:  string(lineBytes),
-					attr:  attr,
-					face:  face,
-					width: a.measureString(face, string(lineBytes)),
-				})
-				lineWidth = segments[0].width
-			}
+				docY += height + lineGap
 
-			height := maxAscent + maxDescent + int(6*a.uiScales[a.uiScaleIdx])
-			if height < 18 {
-				height = 18
+				if !a.pagedMode || lineEnd >= logicalEnd {
+					break
+				}
+				wrapStart = lineEnd
+				for wrapStart < logicalEnd {
+					r, size := utf8.DecodeRune(textBytes[wrapStart:logicalEnd])
+					if size <= 0 || !unicode.IsSpace(r) {
+						break
+					}
+					wrapStart += size
+				}
 			}
-			a.lineLayouts = append(a.lineLayouts, lineLayout{
-				block:     bi,
-				startByte: lineStart,
-				text:      lineBytes,
-				segments:  segments,
-				docX:      8,
-				docY:      docY,
-				height:    height,
-				ascent:    maxAscent,
-				width:     lineWidth,
-			})
-
-			if 8+lineWidth > maxWidth {
-				maxWidth = 8 + lineWidth
-			}
-			docY += height + lineGap
-
 			if !hasNL {
 				break
 			}
-			lineStart = lineEnd + 1
+			logicalStart = logicalEnd + 1
 		}
 		docY += blockGap
 	}
@@ -1613,7 +2404,11 @@ func (a *App) layoutDocumentLines() {
 	contentW := max(1, a.contentRect.w-12)
 	totalHeight := docY + 6
 	a.maxY = math.Max(0, float64(totalHeight-a.contentRect.h))
-	a.maxX = math.Max(0, float64(maxWidth-contentW))
+	if a.pagedMode {
+		a.maxX = 0
+	} else {
+		a.maxX = math.Max(0, float64(maxWidth-contentW))
+	}
 	a.clampScroll()
 
 	for i := range a.lineLayouts {
@@ -1621,6 +2416,58 @@ func (a *App) layoutDocumentLines() {
 		a.lineLayouts[i].viewX = a.contentRect.x + a.lineLayouts[i].docX - int(a.scrollX)
 		a.lineLayouts[i].baseline = a.lineLayouts[i].y + a.lineLayouts[i].ascent + 1
 	}
+}
+
+func normalizeStyleAttr(attr sqdoc.StyleAttr, fallbackFamily sqdoc.FontFamily) sqdoc.StyleAttr {
+	if attr.FontSizePt == 0 {
+		attr.FontSizePt = 14
+	}
+	if attr.ColorRGBA == 0 {
+		attr.ColorRGBA = 0x202020FF
+	}
+	if !isFontFamilySupported(attr.FontFamily) {
+		attr.FontFamily = normalizeFontFamilyApp(fallbackFamily)
+	}
+	return attr
+}
+
+func (a *App) wrapSegmentEnd(text []byte, runs []sqdoc.StyleRun, start, lineEnd, maxWidth int) int {
+	if start >= lineEnd || maxWidth <= 0 {
+		return lineEnd
+	}
+	width := 0
+	lastBreak := -1
+	pos := start
+	for pos < lineEnd {
+		r, size := utf8.DecodeRune(text[pos:lineEnd])
+		if size <= 0 {
+			size = 1
+		}
+		attr := normalizeStyleAttr(styleAttrAtOffset(runs, pos), a.preferredFontFamily)
+		face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic, attr.FontFamily)
+		rw := a.measureString(face, string(text[pos:pos+size]))
+		if width+rw > maxWidth && pos > start {
+			if lastBreak > start {
+				return lastBreak
+			}
+			return pos
+		}
+		width += rw
+		if unicode.IsSpace(r) {
+			lastBreak = pos
+		}
+		pos += size
+	}
+	return lineEnd
+}
+
+func styleAttrAtOffset(runs []sqdoc.StyleRun, offset int) sqdoc.StyleAttr {
+	for _, run := range runs {
+		if int(run.Start) <= offset && offset < int(run.End) {
+			return run.Attr
+		}
+	}
+	return defaultAttr()
 }
 
 func (a *App) drawDocumentText(screen *ebiten.Image) {
@@ -1738,7 +2585,7 @@ func (a *App) drawScrollbars() {
 		}
 		a.frameBuffer.FillRect(trackX, thumbY, 4, thumbH, color.RGBA{R: 156, G: 170, B: 190, A: 255})
 	}
-	if a.maxX > 0 {
+	if !a.pagedMode && a.maxX > 0 {
 		trackX := a.contentRect.x + 2
 		trackY := a.contentRect.y + a.contentRect.h - 6
 		trackW := a.contentRect.w - 8
@@ -1793,7 +2640,7 @@ func (a *App) drawColorPickerOverlay(screen *ebiten.Image) {
 	ebitenutil.DrawLine(screen, float64(px), float64(py), float64(px), float64(py+ph), color.RGBA{R: 178, G: 191, B: 210, A: 255})
 	ebitenutil.DrawLine(screen, float64(px+pw), float64(py), float64(px+pw), float64(py+ph), color.RGBA{R: 178, G: 191, B: 210, A: 255})
 	// caption
-	captionFace := a.uiFace(9, false, false)
+	captionFace := a.uiFace(9, false, false, sqdoc.FontFamilySans)
 	text.Draw(screen, "Color", captionFace, px+8, py+14, color.RGBA{R: 44, G: 58, B: 82, A: 255})
 	// swatches (re-use positions in a.colorSwatches)
 	for _, sw := range a.colorSwatches {
@@ -1838,8 +2685,8 @@ func (a *App) drawPasswordPrompt(screen *ebiten.Image, w, h int) {
 	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 160, G: 176, B: 198, A: 255})
 	ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 160, G: 176, B: 198, A: 255})
 
-	titleFace := a.uiFace(12, true, false)
-	labelFace := a.uiFace(10, false, false)
+	titleFace := a.uiFace(12, true, false, sqdoc.FontFamilySans)
+	labelFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
 	text.Draw(screen, "Password Required", titleFace, r.x+20, r.y+30, color.RGBA{R: 24, G: 38, B: 56, A: 255})
 	fileLabel := "File: " + filepath.Base(a.passwordPromptPath)
 	text.Draw(screen, fileLabel, labelFace, r.x+20, r.y+54, color.RGBA{R: 52, G: 66, B: 92, A: 255})
@@ -1946,6 +2793,10 @@ func (a *App) byteAtX(line lineLayout, relX int) int {
 }
 
 func (a *App) clampScroll() {
+	if a.pagedMode {
+		a.scrollX = 0
+		a.maxX = 0
+	}
 	if a.scrollX < 0 {
 		a.scrollX = 0
 	}
@@ -1986,16 +2837,18 @@ func (a *App) ensureCaretVisible() {
 			a.scrollY = bottom - float64(a.contentRect.h)
 		}
 
-		rel := caret - lineStart
-		caretDocX := float64(ll.docX + a.lineAdvance(ll, rel))
-		viewLeft := a.scrollX
-		viewRight := a.scrollX + float64(a.contentRect.w-12)
-		padding := 16.0
-		if caretDocX < viewLeft+padding {
-			a.scrollX = math.Max(0, caretDocX-padding)
-		}
-		if caretDocX > viewRight-padding {
-			a.scrollX = caretDocX - float64(a.contentRect.w-12) + padding
+		if !a.pagedMode {
+			rel := caret - lineStart
+			caretDocX := float64(ll.docX + a.lineAdvance(ll, rel))
+			viewLeft := a.scrollX
+			viewRight := a.scrollX + float64(a.contentRect.w-12)
+			padding := 16.0
+			if caretDocX < viewLeft+padding {
+				a.scrollX = math.Max(0, caretDocX-padding)
+			}
+			if caretDocX > viewRight-padding {
+				a.scrollX = caretDocX - float64(a.contentRect.w-12) + padding
+			}
 		}
 		break
 	}
@@ -2055,6 +2908,9 @@ func (a *App) redo() {
 func (a *App) openDocumentDialog() error {
 	path, err := dialog.File().Filter("SQDoc files", "sqdoc").Load()
 	if err != nil {
+		if errors.Is(err, dialog.ErrCancelled) {
+			return nil
+		}
 		return err
 	}
 	if path == "" {
@@ -2097,7 +2953,12 @@ func (a *App) openDocumentDialog() error {
 	a.state = editor.NewState(doc)
 	a.filePath = path
 	a.status = "Opened " + filepath.Base(path)
+	a.scrollX, a.scrollY = 0, 0
+	a.maxX, a.maxY = 0, 0
+	a.undoHistory = a.undoHistory[:0]
+	a.redoHistory = a.redoHistory[:0]
 	a.applyEnvelopeSettings(env)
+	a.applyDocumentMetadataSettings(doc.Metadata)
 	return nil
 }
 
@@ -2106,6 +2967,9 @@ func (a *App) saveDocument(saveAs bool) error {
 	if saveAs || path == "" {
 		p, err := dialog.File().Filter("SQDoc files", "sqdoc").Save()
 		if err != nil {
+			if errors.Is(err, dialog.ErrCancelled) {
+				return nil
+			}
 			return err
 		}
 		path = p
@@ -2116,6 +2980,9 @@ func (a *App) saveDocument(saveAs bool) error {
 	if a.state == nil || a.state.Doc == nil {
 		return errors.New("no document to save")
 	}
+	a.state.Doc.Metadata.PagedMode = a.pagedMode
+	a.state.Doc.Metadata.ParagraphGap = uint16(max(0, a.paragraphGap))
+	a.state.Doc.Metadata.PreferredFontFamily = normalizeFontFamilyApp(a.preferredFontFamily)
 	opts := sqdoc.SaveOptions{Compression: a.compressionEnabled, Encryption: sqdoc.EncryptionOptions{Enabled: a.encryptionEnabled, Password: a.encryptionPassword}}
 	if err := sqdoc.SaveWithOptions(path, a.state.Doc, opts); err != nil {
 		return err
@@ -2171,12 +3038,13 @@ func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
 	a.drawFilledRectOnScreen(screen, a.helpClose.x, a.helpClose.y, a.helpClose.w, a.helpClose.h, color.RGBA{R: 236, G: 241, B: 248, A: 255})
 	text.Draw(screen, "Close", face, a.helpClose.x+22, a.helpClose.y+20, color.RGBA{R: 52, G: 66, B: 92, A: 255})
 
-	titleFace := a.uiFace(12, true, false)
+	titleFace := a.uiFace(12, true, false, sqdoc.FontFamilySans)
 	text.Draw(screen, "Help", titleFace, r.x+22, r.y+30, color.RGBA{R: 30, G: 45, B: 67, A: 255})
 
 	lines := []string{
 		"Ctrl+S: Save | Ctrl+Shift+S: Save As",
-		"Ctrl+O: Open | Ctrl+N: New",
+		"Ctrl+O: Open | Ctrl+N: New | Ctrl+T: New Tab",
+		"Ctrl+Tab / Ctrl+Shift+Tab: Switch tabs",
 		"Ctrl+Z: Undo | Ctrl+Y: Redo",
 		"Ctrl+B/I/U: Bold / Italic / Underline",
 		"Ctrl+Shift+H: Toggle text highlight",
@@ -2186,7 +3054,7 @@ func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
 		"F1 or Esc closes this dialog",
 	}
 	y := r.y + 62
-	labelFace := a.uiFace(10, false, false)
+	labelFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
 	for _, l := range lines {
 		text.Draw(screen, l, labelFace, r.x+20, y, color.RGBA{R: 48, G: 60, B: 78, A: 255})
 		y += int(24 * a.uiScales[a.uiScaleIdx])
@@ -2219,9 +3087,34 @@ func (a *App) fillRectWithinContent(x, y, w, h int, c color.RGBA) {
 }
 
 func defaultAttr() sqdoc.StyleAttr {
-	return sqdoc.StyleAttr{FontSizePt: 14, ColorRGBA: 0x202020FF}
+	return sqdoc.StyleAttr{FontSizePt: 14, ColorRGBA: 0x202020FF, FontFamily: sqdoc.FontFamilySans}
 }
 
 func rgbaFromUint32(u uint32) color.RGBA {
 	return color.RGBA{R: uint8((u >> 24) & 0xFF), G: uint8((u >> 16) & 0xFF), B: uint8((u >> 8) & 0xFF), A: uint8(u & 0xFF)}
+}
+
+func nextRuneBoundary(text []byte, pos int) int {
+	if pos < 0 {
+		pos = 0
+	}
+	if pos >= len(text) {
+		return len(text)
+	}
+	_, size := utf8.DecodeRune(text[pos:])
+	if size <= 0 {
+		size = 1
+	}
+	return pos + size
+}
+
+func isFontFamilySupported(f sqdoc.FontFamily) bool {
+	return f == sqdoc.FontFamilySans || f == sqdoc.FontFamilySerif || f == sqdoc.FontFamilyMonospace
+}
+
+func normalizeFontFamilyApp(f sqdoc.FontFamily) sqdoc.FontFamily {
+	if !isFontFamilySupported(f) {
+		return sqdoc.FontFamilySans
+	}
+	return f
 }
