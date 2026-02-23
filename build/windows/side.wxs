@@ -1,6 +1,6 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-    Name="SIDE"
+    Name="FtR SIDE"
     Manufacturer="Quan Thai"
     Version="0.6.0"
     UpgradeCode="3653629c-46a7-4098-997a-748b93792fb7"
@@ -14,15 +14,15 @@
 
     <!-- Directory Structure -->
     <StandardDirectory Id="LocalAppDataFolder">
-      <Directory Id="INSTALLFOLDER" Name="SIDE"/>
+      <Directory Id="INSTALLFOLDER" Name="FtR SIDE"/>
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ProgramMenuDir" Name="SIDE"/>
+      <Directory Id="ProgramMenuDir" Name="FtR SIDE"/>
     </StandardDirectory>
 
     <!-- Feature -->
-    <Feature Id="MainFeature" Title="SIDE" Level="1">
+    <Feature Id="MainFeature" Title="FtR SIDE" Level="1">
       <ComponentGroupRef Id="ProductComponents"/>
     </Feature>
 
@@ -40,7 +40,7 @@
         <Shortcut
           Id="SideStartMenuShortcut"
           Directory="ProgramMenuDir"
-          Name="SIDE"
+          Name="FtR SIDE"
           WorkingDirectory="INSTALLFOLDER"
           Advertise="no"
           Icon="AppIcon"
