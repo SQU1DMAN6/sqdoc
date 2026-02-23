@@ -1,0 +1,70 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="SIDE"
+    Manufacturer="Quan Thai"
+    Version="0.6.0"
+    UpgradeCode="3653629c-46a7-4098-997a-748b93792fb7"
+    Scope="perUser">
+
+    <!-- Media -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- App Icon -->
+    <Icon Id="AppIcon" SourceFile="SIDE.ico" />
+
+    <!-- Directory Structure -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="INSTALLFOLDER" Name="SIDE"/>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="SIDE"/>
+    </StandardDirectory>
+
+    <!-- Feature -->
+    <Feature Id="MainFeature" Title="SIDE" Level="1">
+      <ComponentGroupRef Id="ProductComponents"/>
+    </Feature>
+
+  </Package>
+
+  <!-- Components -->
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExeComponent">
+
+        <!-- Main Binary -->
+        <File Id="SideExe" Source="side.exe" KeyPath="yes"/>
+
+        <!-- Start Menu Shortcut -->
+        <Shortcut
+          Id="SideStartMenuShortcut"
+          Directory="ProgramMenuDir"
+          Name="SIDE"
+          WorkingDirectory="INSTALLFOLDER"
+          Advertise="no"
+          Icon="AppIcon"
+          IconIndex="0"
+          Target="[INSTALLFOLDER]side.exe" />
+
+        <!-- Clean up Start Menu on uninstall -->
+        <RemoveFolder
+          Id="RemoveProgramMenuDir"
+          Directory="ProgramMenuDir"
+          On="uninstall" />
+
+        <!-- Add to User PATH -->
+        <Environment
+          Id="AddToUserPath"
+          Name="PATH"
+          Value="[INSTALLFOLDER]"
+          Permanent="no"
+          Part="last"
+          Action="set"
+          System="no"/>
+
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+
+</Wix>
