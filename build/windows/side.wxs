@@ -2,7 +2,7 @@
   <Package
     Name="FtR SIDE"
     Manufacturer="Quan Thai"
-    Version="0.6.0"
+    Version="0.7.0"
     UpgradeCode="3653629c-46a7-4098-997a-748b93792fb7"
     Scope="perUser">
 

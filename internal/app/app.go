@@ -2,13 +2,25 @@ package app
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
 	"image/color"
+	_ "image/gif"
+	_ "image/jpeg"
+	"image/png"
+	"io"
+	iofs "io/fs"
 	"math"
+	"net/url"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -17,12 +29,14 @@ import (
 	"sqdoc/internal/ui"
 	"sqdoc/pkg/sqdoc"
 
-	"github.com/atotto/clipboard"
+	textclipboard "github.com/atotto/clipboard"
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/ebitenutil"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 	"github.com/hajimehoshi/ebiten/v2/text"
 	"github.com/sqweek/dialog"
+	imgclipboard "golang.design/x/clipboard"
+	_ "golang.org/x/image/bmp"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/basicfont"
 	"golang.org/x/image/font/gofont/gobold"
@@ -36,6 +50,7 @@ import (
 	"golang.org/x/image/font/gofont/gomonoitalic"
 	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
+	_ "golang.org/x/image/webp"
 )
 
 type snapshot struct {
@@ -97,12 +112,16 @@ type dataMapLabel struct {
 }
 
 type lineSegment struct {
-	start int
-	end   int
-	text  string
-	attr  sqdoc.StyleAttr
-	face  font.Face
-	width int
+	start     int
+	end       int
+	text      string
+	attr      sqdoc.StyleAttr
+	face      font.Face
+	width     int
+	isImage   bool
+	imagePath string
+	imageW    int
+	imageH    int
 }
 
 type lineLayout struct {
@@ -118,6 +137,31 @@ type lineLayout struct {
 	height    int
 	ascent    int
 	width     int
+}
+
+type inlineImageToken struct {
+	start int
+	end   int
+	path  string
+	w     int
+	h     int
+}
+
+type imageHit struct {
+	block int
+	start int
+	end   int
+	path  string
+	w     int
+	h     int
+	r     rect
+}
+
+type cachedInlineImage struct {
+	img *ebiten.Image
+	w   int
+	h   int
+	err error
 }
 
 type fontKey struct {
@@ -236,6 +280,11 @@ type App struct {
 	tabChoiceOpen  rect
 	tabChoiceClose rect
 
+	showInsertMenu      bool
+	insertMenuRect      rect
+	insertImageFileRect rect
+	insertImageClipRect rect
+
 	showEncryption        bool
 	encryptionPanel       rect
 	encryptionCloseRect   rect
@@ -271,10 +320,43 @@ type App struct {
 	maxX    float64
 	maxY    float64
 
-	dragSelecting bool
+	dragSelecting        bool
+	dragStartBlock       int
+	dragStartByte        int
+	dragSelectionStarted bool
+	dragStartX           int
+	dragStartY           int
 
 	screenW int
 	screenH int
+
+	imageCache map[string]cachedInlineImage
+
+	dropBatchActive bool
+
+	imageClipboardReady    bool
+	imageClipboardInitDone bool
+	pendingFollowCaret     bool
+
+	selectedImageValid bool
+	selectedImage      imageHit
+
+	dragImagePending   bool
+	dragImageActive    bool
+	dragImageStartX    int
+	dragImageStartY    int
+	dragImageOffsetX   int
+	dragImageOffsetY   int
+	dragImageDropBlock int
+	dragImageDropByte  int
+
+	resizeImageActive bool
+	resizeStartX      int
+	resizeStartY      int
+	resizeBaseW       int
+	resizeBaseH       int
+	resizePreviewW    int
+	resizePreviewH    int
 }
 
 func New() *App {
@@ -303,6 +385,7 @@ func New() *App {
 		pagedMode:           doc.Metadata.PagedMode,
 		paragraphGap:        int(doc.Metadata.ParagraphGap),
 		preferredFontFamily: doc.Metadata.PreferredFontFamily,
+		imageCache:          map[string]cachedInlineImage{},
 	}
 	if app.paragraphGap <= 0 {
 		app.paragraphGap = 8
@@ -330,6 +413,7 @@ func (a *App) Update() error {
 	defer a.syncActiveTabFromRuntime()
 
 	a.frameTick++
+	followCaret := false
 	ctrl := ebiten.IsKeyPressed(ebiten.KeyControl) || ebiten.IsKeyPressed(ebiten.KeyMeta)
 	shift := ebiten.IsKeyPressed(ebiten.KeyShift)
 	alt := ebiten.IsKeyPressed(ebiten.KeyAlt)
@@ -346,10 +430,15 @@ func (a *App) Update() error {
 	if a.showHelp {
 		a.layoutHelpDialogBounds(winW, winH)
 	}
+	a.handleDroppedImages()
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
 		if a.showPasswordPrompt {
 			a.closePasswordPrompt()
+			return nil
+		}
+		if a.showInsertMenu {
+			a.showInsertMenu = false
 			return nil
 		}
 		if a.showTabChooser {
@@ -377,7 +466,8 @@ func (a *App) Update() error {
 			a.showColorPicker = false
 			return nil
 		}
-		return ebiten.Termination
+		a.status = "Esc closes dialogs. Use Alt+F4 to exit."
+		return nil
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyF1) {
 		a.showHelp = !a.showHelp
@@ -391,6 +481,14 @@ func (a *App) Update() error {
 	}
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyT) {
 		a.showTabChooser = true
+	}
+	if ctrl && shift && inpututil.IsKeyJustPressed(ebiten.KeyI) {
+		a.invokeAction("insert_image_file")
+		return nil
+	}
+	if ctrl && alt && inpututil.IsKeyJustPressed(ebiten.KeyV) {
+		a.invokeAction("insert_image_clipboard")
+		return nil
 	}
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyTab) {
 		if shift {
@@ -407,6 +505,14 @@ func (a *App) Update() error {
 		}
 		a.clampScroll()
 		return nil
+	}
+	if a.showInsertMenu {
+		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+			x, y := ebiten.CursorPosition()
+			if a.handleInsertMenuClick(x, y) {
+				return nil
+			}
+		}
 	}
 	if a.showHelp {
 		if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
@@ -455,9 +561,6 @@ func (a *App) Update() error {
 			}
 			return nil
 		}
-		if a.handleTabBarClick(x, y) {
-			return nil
-		}
 		if id, ok := a.actionAt(x, y); ok {
 			a.invokeAction(id)
 			return nil
@@ -465,33 +568,144 @@ func (a *App) Update() error {
 		if handled := a.handleToolbarClick(x, y); handled {
 			return nil
 		}
+		if a.handleTabBarClick(x, y) {
+			return nil
+		}
 		if a.showColorPicker && !a.colorPopupRect.contains(x, y) {
 			a.showColorPicker = false
 		}
 		if a.contentRect.contains(x, y) {
+			if !shift {
+				if img, ok := a.imageAtPoint(x, y); ok {
+					a.selectedImageValid = true
+					a.selectedImage = img
+					a.state.ClearSelection()
+					a.state.SetCaret(img.block, img.end)
+					a.dragSelecting = false
+					a.dragSelectionStarted = false
+					a.dragImagePending = false
+					a.dragImageActive = false
+					if a.imageResizeHandleRect(img.r).contains(x, y) {
+						a.resizeImageActive = true
+						a.resizeStartX = x
+						a.resizeStartY = y
+						a.resizeBaseW = img.w
+						a.resizeBaseH = img.h
+						a.resizePreviewW = img.w
+						a.resizePreviewH = img.h
+						return nil
+					}
+					a.dragImagePending = true
+					a.dragImageStartX = x
+					a.dragImageStartY = y
+					a.dragImageOffsetX = x - img.r.x
+					a.dragImageOffsetY = y - img.r.y
+					a.dragImageDropBlock = img.block
+					a.dragImageDropByte = img.end
+					return nil
+				}
+			}
+			a.selectedImageValid = false
 			block, bytePos := a.hitTestPosition(x, y)
 			if shift {
 				a.state.EnsureSelectionAnchor()
+				a.state.SetCaret(block, bytePos)
+				a.state.UpdateSelectionFromCaret()
+				a.dragSelecting = false
 			} else {
+				a.state.SetCaret(block, bytePos)
 				a.state.ClearSelection()
-				a.state.EnsureSelectionAnchor()
+				a.dragSelecting = true
+				a.dragStartBlock = block
+				a.dragStartByte = bytePos
+				a.dragSelectionStarted = false
+				a.dragStartX = x
+				a.dragStartY = y
 			}
-			a.state.SetCaret(block, bytePos)
-			a.state.UpdateSelectionFromCaret()
-			a.dragSelecting = true
 		} else {
 			a.state.ClearSelection()
+			a.selectedImageValid = false
+			a.dragSelecting = false
 		}
+	}
+	if a.resizeImageActive && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+		x, _ := ebiten.CursorPosition()
+		dx := x - a.resizeStartX
+		newW := a.resizeBaseW + dx
+		if newW < 24 {
+			newW = 24
+		}
+		if newW > max(24, a.contentRect.w-24) {
+			newW = max(24, a.contentRect.w-24)
+		}
+		aspect := 1.0
+		if a.resizeBaseH > 0 {
+			aspect = float64(a.resizeBaseW) / float64(a.resizeBaseH)
+		}
+		newH := int(float64(newW) / aspect)
+		if newH < 20 {
+			newH = 20
+		}
+		a.resizePreviewW = newW
+		a.resizePreviewH = newH
+	}
+	if a.dragImagePending && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+		x, y := ebiten.CursorPosition()
+		if absInt(x-a.dragImageStartX) > 2 || absInt(y-a.dragImageStartY) > 2 {
+			a.dragImagePending = false
+			a.dragImageActive = true
+		}
+	}
+	if a.dragImageActive && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
+		x, y := ebiten.CursorPosition()
+		block, bytePos := a.hitTestPosition(x, y)
+		a.dragImageDropBlock = block
+		a.dragImageDropByte = bytePos
 	}
 	if a.dragSelecting && ebiten.IsMouseButtonPressed(ebiten.MouseButtonLeft) {
 		x, y := ebiten.CursorPosition()
 		block, bytePos := a.hitTestPosition(x, y)
-		a.state.SetCaret(block, bytePos)
-		a.state.UpdateSelectionFromCaret()
+		if !a.dragSelectionStarted {
+			movedMouse := absInt(x-a.dragStartX) > 1 || absInt(y-a.dragStartY) > 1
+			movedCaret := block != a.dragStartBlock || bytePos != a.dragStartByte
+			if movedMouse || movedCaret {
+				a.state.SetCaret(a.dragStartBlock, a.dragStartByte)
+				a.state.EnsureSelectionAnchor()
+				a.dragSelectionStarted = true
+			}
+		}
+		if a.dragSelectionStarted {
+			a.state.SetCaret(block, bytePos)
+			a.state.UpdateSelectionFromCaret()
+		}
 		a.ensureCaretVisible()
 	}
 	if inpututil.IsMouseButtonJustReleased(ebiten.MouseButtonLeft) {
+		if a.resizeImageActive {
+			a.resizeImageActive = false
+			if a.selectedImageValid && (absInt(a.resizePreviewW-a.resizeBaseW) > 1 || absInt(a.resizePreviewH-a.resizeBaseH) > 1) {
+				a.pushUndoSnapshot()
+				if err := a.updateSelectedImageTokenSize(a.resizePreviewW, a.resizePreviewH); err != nil {
+					a.status = "Image resize failed: " + err.Error()
+				} else {
+					a.status = "Image resized"
+				}
+			}
+		}
+		if a.dragImageActive {
+			a.dragImageActive = false
+			if a.selectedImageValid {
+				a.pushUndoSnapshot()
+				if err := a.moveSelectedImageToken(a.dragImageDropBlock, a.dragImageDropByte); err != nil {
+					a.status = "Image move failed: " + err.Error()
+				} else {
+					a.status = "Image moved"
+				}
+			}
+		}
+		a.dragImagePending = false
 		a.dragSelecting = false
+		a.dragSelectionStarted = false
 	}
 
 	if a.showPasswordPrompt {
@@ -537,7 +751,7 @@ func (a *App) Update() error {
 	}
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyC) && !shift {
 		if a.state.HasSelection() {
-			if err := clipboard.WriteAll(a.state.SelectedText()); err != nil {
+			if err := textclipboard.WriteAll(a.state.SelectedText()); err != nil {
 				a.status = "Copy failed: " + err.Error()
 			}
 		}
@@ -546,22 +760,42 @@ func (a *App) Update() error {
 		if a.state.HasSelection() {
 			recordMutation()
 			selected := a.state.SelectedText()
-			if err := clipboard.WriteAll(selected); err != nil {
+			if err := textclipboard.WriteAll(selected); err != nil {
 				a.status = "Cut failed: " + err.Error()
 			} else {
 				a.state.DeleteSelection()
+				followCaret = true
 			}
 		}
 	}
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyV) {
-		paste, err := clipboard.ReadAll()
+		insertedImage, imgErr := a.tryInsertImageFromClipboard()
+		if insertedImage {
+			if imgErr != nil {
+				a.status = "Paste image failed: " + imgErr.Error()
+			}
+			a.clampScroll()
+			a.ensureCaretVisible()
+			return nil
+		}
+		paste, err := textclipboard.ReadAll()
 		if err != nil {
-			a.status = "Paste failed: " + err.Error()
-		} else if paste != "" {
-			recordMutation()
-			if err := a.state.InsertTextAtCaret(paste); err != nil {
+			if imgErr != nil {
+				a.status = "Paste failed: " + imgErr.Error()
+			} else {
 				a.status = "Paste failed: " + err.Error()
 			}
+		} else if paste != "" {
+			recordMutation()
+			a.snapCaretOutOfInlineImage(0)
+			a.selectedImageValid = false
+			if err := a.state.InsertTextAtCaret(paste); err != nil {
+				a.status = "Paste failed: " + err.Error()
+			} else {
+				followCaret = true
+			}
+		} else if imgErr != nil {
+			a.status = "Paste image failed: " + imgErr.Error()
 		}
 	}
 	if ctrl && (inpututil.IsKeyJustPressed(ebiten.KeyEqual) || inpututil.IsKeyJustPressed(ebiten.KeyKPAdd)) {
@@ -602,20 +836,28 @@ func (a *App) Update() error {
 	}
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
 		recordMutation()
-		a.state.DeleteWordBackward()
+		if !a.deleteSelectedOrAdjacentImage(true) {
+			a.state.DeleteWordBackward()
+		}
+		followCaret = true
 	}
 	if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyDelete) {
 		recordMutation()
-		a.state.DeleteWordForward()
+		if !a.deleteSelectedOrAdjacentImage(false) {
+			a.state.DeleteWordForward()
+		}
+		followCaret = true
 	}
 
-	moveWithSelection := func(move func()) {
+	moveWithSelection := func(direction int, move func()) {
 		if shift {
 			a.state.EnsureSelectionAnchor()
 		} else {
 			a.state.ClearSelection()
 		}
 		move()
+		a.snapCaretOutOfInlineImage(direction)
+		a.selectedImageValid = false
 		if shift {
 			a.state.UpdateSelectionFromCaret()
 		}
@@ -623,89 +865,104 @@ func (a *App) Update() error {
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) {
 		if ctrl {
-			moveWithSelection(func() {
+			moveWithSelection(0, func() {
 				a.state.MoveBlock(-1)
 				a.state.MoveCaretToLineStart()
 			})
 		} else if alt {
 			a.scrollY -= float64(a.contentRect.h) * 0.8
 		} else {
-			moveWithSelection(func() { a.state.MoveBlock(-1) })
+			moveWithSelection(0, func() { a.state.MoveBlock(-1) })
 		}
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) {
 		if ctrl {
-			moveWithSelection(func() {
+			moveWithSelection(0, func() {
 				a.state.MoveBlock(1)
 				a.state.MoveCaretToLineStart()
 			})
 		} else if alt {
 			a.scrollY += float64(a.contentRect.h) * 0.8
 		} else {
-			moveWithSelection(func() { a.state.MoveBlock(1) })
+			moveWithSelection(0, func() { a.state.MoveBlock(1) })
 		}
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
 		if ctrl {
-			moveWithSelection(a.state.MoveCaretWordLeft)
+			moveWithSelection(-1, a.state.MoveCaretWordLeft)
 		} else if alt {
-			moveWithSelection(a.state.MoveCaretToLineStart)
+			moveWithSelection(-1, a.state.MoveCaretToLineStart)
 		} else {
-			moveWithSelection(a.state.MoveCaretLeft)
+			moveWithSelection(-1, a.state.MoveCaretLeft)
 		}
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
 		if ctrl {
-			moveWithSelection(a.state.MoveCaretWordRight)
+			moveWithSelection(1, a.state.MoveCaretWordRight)
 		} else if alt {
-			moveWithSelection(a.state.MoveCaretToLineEnd)
+			moveWithSelection(1, a.state.MoveCaretToLineEnd)
 		} else {
-			moveWithSelection(a.state.MoveCaretRight)
+			moveWithSelection(1, a.state.MoveCaretRight)
 		}
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyHome) {
 		if ctrl {
-			moveWithSelection(func() { a.state.SetCaret(0, 0) })
+			moveWithSelection(0, func() { a.state.SetCaret(0, 0) })
 		} else {
-			moveWithSelection(a.state.MoveCaretToLineStart)
+			moveWithSelection(-1, a.state.MoveCaretToLineStart)
 		}
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyEnd) {
 		if ctrl {
-			moveWithSelection(func() {
+			moveWithSelection(0, func() {
 				last := a.state.BlockCount() - 1
 				if last >= 0 {
 					a.state.SetCaret(last, len(a.state.AllBlockTexts()[last]))
 				}
 			})
 		} else {
-			moveWithSelection(a.state.MoveCaretToLineEnd)
+			moveWithSelection(1, a.state.MoveCaretToLineEnd)
 		}
 	}
 
 	if ctrl || a.showEncryption || a.showPasswordPrompt || a.showTabChooser {
 		a.clampScroll()
-		a.ensureCaretVisible()
+		if followCaret {
+			a.pendingFollowCaret = true
+		}
 		return nil
 	}
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyKPEnter) {
 		recordMutation()
+		a.snapCaretOutOfInlineImage(0)
+		a.selectedImageValid = false
 		if err := a.state.InsertTextAtCaret("\n"); err != nil {
 			a.status = "Insert newline failed: " + err.Error()
+		} else {
+			followCaret = true
 		}
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyBackspace) {
 		recordMutation()
-		a.state.Backspace()
+		if !a.deleteSelectedOrAdjacentImage(true) {
+			a.state.Backspace()
+		}
+		followCaret = true
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyDelete) {
 		recordMutation()
-		a.state.DeleteForward()
+		if !a.deleteSelectedOrAdjacentImage(false) {
+			a.state.DeleteForward()
+		}
+		followCaret = true
 	}
 	if inpututil.IsKeyJustPressed(ebiten.KeyTab) {
 		recordMutation()
+		a.snapCaretOutOfInlineImage(0)
+		a.selectedImageValid = false
 		_ = a.state.InsertTextAtCaret("    ")
+		followCaret = true
 	}
 
 	for _, r := range ebiten.AppendInputChars(nil) {
@@ -713,11 +970,16 @@ func (a *App) Update() error {
 			continue
 		}
 		recordMutation()
+		a.snapCaretOutOfInlineImage(0)
+		a.selectedImageValid = false
 		_ = a.state.InsertTextAtCaret(string(r))
+		followCaret = true
 	}
 
 	a.clampScroll()
-	a.ensureCaretVisible()
+	if followCaret {
+		a.pendingFollowCaret = true
+	}
 	return nil
 }
 
@@ -735,7 +997,7 @@ func (a *App) handleOverlayTextInput(ctrl bool) bool {
 			consumed = true
 		}
 		if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyV) {
-			if clip, err := clipboard.ReadAll(); err == nil && clip != "" {
+			if clip, err := textclipboard.ReadAll(); err == nil && clip != "" {
 				a.passwordPromptInput += clip
 				if len(a.passwordPromptInput) > 128 {
 					a.passwordPromptInput = a.passwordPromptInput[:128]
@@ -798,7 +1060,7 @@ func (a *App) handleOverlayTextInput(ctrl bool) bool {
 			consumed = true
 		}
 		if ctrl && inpututil.IsKeyJustPressed(ebiten.KeyV) {
-			if clip, err := clipboard.ReadAll(); err == nil && clip != "" {
+			if clip, err := textclipboard.ReadAll(); err == nil && clip != "" {
 				a.encryptionPassword += clip
 				if len(a.encryptionPassword) > 128 {
 					a.encryptionPassword = a.encryptionPassword[:128]
@@ -1060,6 +1322,99 @@ func (a *App) applyFontInput() {
 	a.status = fmt.Sprintf("Font size set to %dpt", sz)
 }
 
+func (a *App) layoutInsertMenuBounds() {
+	a.insertMenuRect = rect{}
+	a.insertImageFileRect = rect{}
+	a.insertImageClipRect = rect{}
+	if !a.showInsertMenu {
+		return
+	}
+	var anchor rect
+	found := false
+	if btn, ok := a.topActionRect("insert"); ok {
+		anchor = btn
+		found = true
+	}
+	if !found {
+		return
+	}
+	w := int(230 * a.uiScales[a.uiScaleIdx])
+	if w < 210 {
+		w = 210
+	}
+	rowH := int(30 * a.uiScales[a.uiScaleIdx])
+	if rowH < 24 {
+		rowH = 24
+	}
+	h := rowH*2 + 8
+	x := anchor.x
+	y := anchor.y + anchor.h + 2
+	a.insertMenuRect = rect{x: x, y: y, w: w, h: h}
+	a.insertImageFileRect = rect{x: x + 4, y: y + 4, w: w - 8, h: rowH}
+	a.insertImageClipRect = rect{x: x + 4, y: y + 4 + rowH, w: w - 8, h: rowH}
+}
+
+func (a *App) drawInsertMenu(screen *ebiten.Image, face font.Face) {
+	if !a.showInsertMenu {
+		return
+	}
+	a.layoutInsertMenuBounds()
+	if a.insertMenuRect.w <= 0 {
+		return
+	}
+	r := a.insertMenuRect
+	a.drawFilledRectOnScreen(screen, r.x, r.y, r.w, r.h, color.RGBA{R: 249, G: 251, B: 254, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x+r.w), float64(r.y), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y+r.h), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x), float64(r.y), float64(r.x), float64(r.y+r.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+	ebitenutil.DrawLine(screen, float64(r.x+r.w), float64(r.y), float64(r.x+r.w), float64(r.y+r.h), color.RGBA{R: 172, G: 184, B: 202, A: 255})
+
+	mx, my := ebiten.CursorPosition()
+	drawMenuItem := func(rr rect, label string) {
+		bg := color.RGBA{R: 241, G: 245, B: 251, A: 255}
+		if rr.contains(mx, my) {
+			bg = color.RGBA{R: 223, G: 236, B: 252, A: 255}
+		}
+		a.drawFilledRectOnScreen(screen, rr.x, rr.y, rr.w, rr.h, bg)
+		text.Draw(screen, label, face, rr.x+10, rr.y+rr.h-8, color.RGBA{R: 42, G: 58, B: 82, A: 255})
+	}
+	drawMenuItem(a.insertImageFileRect, "Image from file...")
+}
+
+func (a *App) handleInsertMenuClick(x, y int) bool {
+	a.layoutInsertMenuBounds()
+	if a.insertMenuRect.w <= 0 {
+		return false
+	}
+	if !a.insertMenuRect.contains(x, y) {
+		if insertBtn, ok := a.topActionRect("insert"); ok && insertBtn.contains(x, y) {
+			return false
+		}
+		a.showInsertMenu = false
+		return true
+	}
+	if a.insertImageFileRect.contains(x, y) {
+		a.showInsertMenu = false
+		a.invokeAction("insert_image_file")
+		return true
+	}
+	if a.insertImageClipRect.contains(x, y) {
+		a.showInsertMenu = false
+		a.invokeAction("insert_image_clipboard")
+		return true
+	}
+	return true
+}
+
+func (a *App) topActionRect(id string) (rect, bool) {
+	for _, btn := range a.topActions {
+		if btn.id == id {
+			return btn.r, true
+		}
+	}
+	return rect{}, false
+}
+
 func (a *App) actionAt(x, y int) (string, bool) {
 	for _, btn := range a.topActions {
 		if btn.r.contains(x, y) {
@@ -1094,6 +1449,8 @@ func (a *App) invokeAction(id string) {
 		if err := a.openDocumentDialog(); err != nil {
 			a.status = "Open failed: " + err.Error()
 		}
+	case "insert":
+		a.showInsertMenu = !a.showInsertMenu
 	case "new_tab":
 		a.showTabChooser = true
 	case "save":
@@ -1181,6 +1538,16 @@ func (a *App) invokeAction(id string) {
 		a.preferredFontFamily = sqdoc.FontFamilyMonospace
 		a.state.SetFontFamily(sqdoc.FontFamilyMonospace)
 		a.status = "Font family: Monospace"
+	case "insert_image_file":
+		if err := a.insertImageFromFileDialog(); err != nil {
+			if !errors.Is(err, dialog.ErrCancelled) {
+				a.status = "Insert image failed: " + err.Error()
+			}
+		}
+	case "insert_image_clipboard":
+		if err := a.insertImageFromClipboard(); err != nil {
+			a.status = "Insert image failed: " + err.Error()
+		}
 	}
 }
 
@@ -1192,10 +1559,10 @@ func (a *App) Draw(screen *ebiten.Image) {
 	}
 
 	layout := ui.DrawShell(a.frameBuffer, a.state, a.theme, a.uiScales[a.uiScaleIdx])
-	menuFace := a.uiFace(11, false, false, sqdoc.FontFamilySans)
-	toolbarFace := a.uiFace(11, false, false, sqdoc.FontFamilySans)
-	statusFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
-	panelFace := a.uiFace(9, false, false, sqdoc.FontFamilySans)
+	menuFace := a.uiFace(12, false, false, sqdoc.FontFamilySans)
+	toolbarFace := a.uiFace(12, false, false, sqdoc.FontFamilySans)
+	statusFace := a.uiFace(11, false, false, sqdoc.FontFamilySans)
+	panelFace := a.uiFace(10, false, false, sqdoc.FontFamilySans)
 
 	a.layoutTopActions(menuFace, layout)
 	a.layoutTabBar(menuFace, layout)
@@ -1204,6 +1571,11 @@ func (a *App) Draw(screen *ebiten.Image) {
 
 	a.drawDocumentChrome(layout)
 	a.layoutDocumentLines()
+	if a.pendingFollowCaret {
+		a.ensureCaretVisible()
+		a.layoutDocumentLines()
+		a.pendingFollowCaret = false
+	}
 	a.drawDocumentSelectionAndCaret()
 	a.drawScrollbars()
 	a.drawDataMapPanel()
@@ -1221,6 +1593,7 @@ func (a *App) Draw(screen *ebiten.Image) {
 	a.drawTabLabels(screen, menuFace)
 	a.drawToolbarLabels(screen, toolbarFace)
 	a.drawDocumentText(screen)
+	a.drawImageInteractionOverlay(screen)
 	a.drawDataMapLabels(screen, panelFace)
 
 	name := a.filePath
@@ -1238,9 +1611,21 @@ func (a *App) Draw(screen *ebiten.Image) {
 	attr := a.state.CurrentStyleAttr()
 	statusLeft := fmt.Sprintf("[ Block %d/%d ] [ Caret %d ] [ Font %dpt ]", a.state.CurrentBlock+1, a.state.BlockCount(), a.state.CaretByte, attr.FontSizePt)
 	statusRight := fmt.Sprintf("[ %s ] [ Scroll X %.0f%% Y %.0f%% ] [ %s ]", name, scrollXPct, scrollYPct, a.status)
-	text.Draw(screen, statusLeft, statusFace, 12, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
-	text.Draw(screen, statusRight, statusFace, 320, h-10, color.RGBA{R: 42, G: 56, B: 80, A: 255})
+	statusBand := rect{x: 0, y: layout.StatusBar, w: w, h: layout.StatusH}
+	statusBaseline := a.centeredTextBaseline(statusBand, statusFace)
+	leftX := int(12 * a.uiScales[a.uiScaleIdx])
+	if leftX < 8 {
+		leftX = 8
+	}
+	rightW := a.measureString(statusFace, statusRight)
+	rightX := w - rightW - int(12*a.uiScales[a.uiScaleIdx])
+	if rightX < leftX+220 {
+		rightX = leftX + 220
+	}
+	text.Draw(screen, statusLeft, statusFace, leftX, statusBaseline, color.RGBA{R: 42, G: 56, B: 80, A: 255})
+	text.Draw(screen, statusRight, statusFace, rightX, statusBaseline, color.RGBA{R: 42, G: 56, B: 80, A: 255})
 
+	a.drawInsertMenu(screen, menuFace)
 	a.drawColorPickerOverlay(screen)
 	a.drawTabChooser(screen, w, h)
 	a.drawEncryptionPanel(screen, w, h)
@@ -1303,11 +1688,11 @@ func (a *App) drawTopActionLabels(screen *ebiten.Image, face font.Face) {
 	textColor := color.RGBA{R: 244, G: 248, B: 255, A: 255}
 	for _, btn := range a.topActions {
 		tw := a.measureString(face, btn.label)
-		ascent := face.Metrics().Ascent.Round()
-		descent := face.Metrics().Descent.Round()
-		textHeight := ascent + descent
 		x := btn.r.x + (btn.r.w-tw)/2
-		baseline := btn.r.y + (btn.r.h+textHeight)/2 - descent
+		if x < btn.r.x+4 {
+			x = btn.r.x + 4
+		}
+		baseline := a.centeredTextBaseline(btn.r, face)
 		text.Draw(screen, btn.label, face, x, baseline, textColor)
 	}
 }
@@ -1327,13 +1712,32 @@ func (a *App) drawToolbarLabels(screen *ebiten.Image, face font.Face) {
 			}
 		}
 		tw := a.measureString(face, label)
-		ascent := face.Metrics().Ascent.Round()
-		descent := face.Metrics().Descent.Round()
-		textHeight := ascent + descent
 		x := btn.r.x + (btn.r.w-tw)/2
-		baseline := btn.r.y + (btn.r.h+textHeight)/2 - descent
+		if x < btn.r.x+4 {
+			x = btn.r.x + 4
+		}
+		baseline := a.centeredTextBaseline(btn.r, face)
 		text.Draw(screen, label, face, x, baseline, labelColor)
 	}
+}
+
+func (a *App) centeredTextBaseline(r rect, face font.Face) int {
+	if face == nil {
+		return r.y + r.h - 2
+	}
+	ascent := face.Metrics().Ascent.Round()
+	descent := face.Metrics().Descent.Round()
+	textHeight := ascent + descent
+	baseline := r.y + (r.h+textHeight)/2 - descent
+	minBaseline := r.y + ascent + 2
+	maxBaseline := r.y + r.h - descent - 2
+	if baseline < minBaseline {
+		baseline = minBaseline
+	}
+	if baseline > maxBaseline {
+		baseline = maxBaseline
+	}
+	return baseline
 }
 
 func (a *App) drawDataMapLabels(screen *ebiten.Image, face font.Face) {
@@ -1669,6 +2073,7 @@ func (a *App) switchTab(index int) {
 	a.activeTab = index
 	a.restoreRuntimeFromTab(index)
 	a.showColorPicker = false
+	a.showInsertMenu = false
 	a.showEncryption = false
 	a.encryptionInputActive = false
 	a.showPasswordPrompt = false
@@ -1900,15 +2305,12 @@ func (a *App) drawTabLabels(screen *ebiten.Image, face font.Face) {
 			label = string(rs[:maxChars-1]) + "..."
 		}
 		tw := a.measureString(face, label)
-		ascent := face.Metrics().Ascent.Round()
-		descent := face.Metrics().Descent.Round()
-		textHeight := ascent + descent
 		availableW := tab.r.w - 26
 		x := tab.r.x + 8
 		if tw < availableW {
 			x = tab.r.x + 8 + (availableW-tw)/2
 		}
-		baseline := tab.r.y + (tab.r.h+textHeight)/2 - descent
+		baseline := a.centeredTextBaseline(tab.r, face)
 		text.Draw(screen, label, face, x, baseline, clr)
 	}
 	for _, closeBtn := range a.tabCloseActions {
@@ -1934,6 +2336,9 @@ func (a *App) drawTabLabels(screen *ebiten.Image, face font.Face) {
 
 func (a *App) handleTabBarClick(x, y int) bool {
 	if !a.shouldShowTabBar() || !a.tabBarRect.contains(x, y) {
+		return false
+	}
+	if a.showColorPicker && a.colorPopupRect.contains(x, y) {
 		return false
 	}
 	for _, closeBtn := range a.tabCloseActions {
@@ -2045,18 +2450,27 @@ func (a *App) handleTabChooserClick(x, y int) {
 
 func (a *App) layoutTopActions(face font.Face, layout ui.Layout) {
 	a.topActions = a.topActions[:0]
-	x := 10
-	y := 4
-	h := layout.MenuH - 8
-	if h < 24 {
-		h = 24
+	scale := a.uiScales[a.uiScaleIdx]
+	x := int(10 * scale)
+	if x < 8 {
+		x = 8
 	}
+	h := layout.MenuH - int(8*scale)
+	minH := int(24 * scale)
+	if minH < 24 {
+		minH = 24
+	}
+	if h < minH {
+		h = minH
+	}
+	y := (layout.MenuH - h) / 2
 	buttons := []actionButton{
 		{id: "new", label: "New"},
 		{id: "new_tab", label: "New Tab"},
 		{id: "open", label: "Open"},
 		{id: "save", label: "Save"},
 		{id: "save_as", label: "Save As"},
+		{id: "insert", label: "Insert", active: a.showInsertMenu},
 		{id: "undo", label: "Undo"},
 		{id: "redo", label: "Redo"},
 		{id: "data_map", label: "Data Map", active: a.showDataMap},
@@ -2068,10 +2482,17 @@ func (a *App) layoutTopActions(face font.Face, layout ui.Layout) {
 	mx, my := ebiten.CursorPosition()
 	for _, btn := range buttons {
 		tw := a.measureString(face, btn.label)
-		pad := 14
+		pad := int(14 * scale)
+		if pad < 10 {
+			pad = 10
+		}
 		w := tw + pad*2
-		if w < 64 {
-			w = 64
+		minW := int(64 * scale)
+		if minW < 64 {
+			minW = 64
+		}
+		if w < minW {
+			w = minW
 		}
 		r := rect{x: x, y: y, w: w, h: h}
 		hover := r.contains(mx, my)
@@ -2086,7 +2507,11 @@ func (a *App) layoutTopActions(face font.Face, layout ui.Layout) {
 		a.frameBuffer.StrokeRect(r.x, r.y, r.w, r.h, 1, color.RGBA{R: 27, G: 54, B: 97, A: 255})
 		btn.r = r
 		a.topActions = append(a.topActions, btn)
-		x += w + 8
+		step := int(8 * scale)
+		if step < 6 {
+			step = 6
+		}
+		x += w + step
 	}
 }
 
@@ -2097,22 +2522,44 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 	a.fontInputRect = rect{}
 
 	attr := a.state.CurrentStyleAttr()
-	x := 14
-	y := layout.MenuH + 8
-	h := layout.ToolbarH - 16
-	if h < 24 {
-		h = 24
+	scale := a.uiScales[a.uiScaleIdx]
+	x := int(14 * scale)
+	if x < 10 {
+		x = 10
 	}
+	h := layout.ToolbarH - int(16*scale)
+	minH := int(24 * scale)
+	if minH < 24 {
+		minH = 24
+	}
+	if h < minH {
+		h = minH
+	}
+	if h > layout.ToolbarH-4 {
+		h = layout.ToolbarH - 4
+	}
+	y := layout.MenuH + (layout.ToolbarH-h)/2
 	mx, my := ebiten.CursorPosition()
 
 	addBtn := func(id, label string, w int, active bool) rect {
-		if w <= 0 {
-			tw := a.measureString(face, label)
-			pad := 10
-			w = tw + pad*2
-			if w < 48 {
-				w = 48
-			}
+		pad := int(10 * scale)
+		if pad < 8 {
+			pad = 8
+		}
+		minW := int(48 * scale)
+		if minW < 48 {
+			minW = 48
+		}
+		tw := a.measureString(face, label)
+		reqW := tw + pad*2
+		if w > 0 {
+			w = int(float32(w) * scale)
+		}
+		if w < reqW {
+			w = reqW
+		}
+		if w < minW {
+			w = minW
 		}
 		r := rect{x: x, y: y, w: w, h: h}
 		hover := r.contains(mx, my)
@@ -2126,7 +2573,11 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 		a.frameBuffer.FillRect(r.x, r.y, r.w, r.h, bg)
 		a.frameBuffer.StrokeRect(r.x, r.y, r.w, r.h, 1, color.RGBA{R: 181, G: 194, B: 214, A: 255})
 		a.toolbarActions = append(a.toolbarActions, actionButton{id: id, label: label, r: r, active: active})
-		x += w + 6
+		step := int(6 * scale)
+		if step < 4 {
+			step = 4
+		}
+		x += w + step
 		return r
 	}
 
@@ -2134,18 +2585,26 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 	addBtn("italic", "Italic", 58, attr.Italic)
 	addBtn("underline", "Underline", 78, attr.Underline)
 	addBtn("highlight", "Highlight", 82, attr.Highlight)
-	x += 4
+	x += max(2, int(4*scale))
 
 	addBtn("font_down", "-", 28, false)
 	fontRect := addBtn("font_edit", "", 56, a.fontInputActive)
 	a.fontInputRect = fontRect
 	addBtn("font_up", "+", 28, false)
-	x += 4
+	x += max(2, int(4*scale))
 
 	colorRect := addBtn("color_toggle", "Color", 68, false)
-	a.frameBuffer.FillRect(colorRect.x+colorRect.w-14, colorRect.y+6, 8, colorRect.h-12, rgbaFromUint32(attr.ColorRGBA))
-	a.frameBuffer.StrokeRect(colorRect.x+colorRect.w-14, colorRect.y+6, 8, colorRect.h-12, 1, color.RGBA{R: 88, G: 102, B: 122, A: 255})
-	x += 4
+	swatchW := max(8, int(8*scale))
+	swatchPadX := max(6, int(6*scale))
+	swatchPadY := max(4, int(6*scale))
+	swatchX := colorRect.x + colorRect.w - swatchW - swatchPadX
+	swatchH := colorRect.h - swatchPadY*2
+	if swatchH < 6 {
+		swatchH = 6
+	}
+	a.frameBuffer.FillRect(swatchX, colorRect.y+swatchPadY, swatchW, swatchH, rgbaFromUint32(attr.ColorRGBA))
+	a.frameBuffer.StrokeRect(swatchX, colorRect.y+swatchPadY, swatchW, swatchH, 1, color.RGBA{R: 88, G: 102, B: 122, A: 255})
+	x += max(2, int(4*scale))
 
 	fam := normalizeFontFamilyApp(attr.FontFamily)
 	addBtn("font_sans", "Sans", 60, fam == sqdoc.FontFamilySans)
@@ -2153,16 +2612,29 @@ func (a *App) layoutToolbarControls(face font.Face, layout ui.Layout) {
 	addBtn("font_mono", "Mono", 60, fam == sqdoc.FontFamilyMonospace)
 
 	if a.showColorPicker {
-		popupW := 184
-		popupH := 88
+		scale := a.uiScales[a.uiScaleIdx]
+		popupW := int(184 * scale)
+		popupH := int(102 * scale)
+		if popupW < 184 {
+			popupW = 184
+		}
+		if popupH < 102 {
+			popupH = 102
+		}
 		px := colorRect.x
 		py := colorRect.y + colorRect.h + 4
 		a.colorPopupRect = rect{x: px, y: py, w: popupW, h: popupH}
 		cols := 6
-		sx := px + 8
-		sy := py + 20
-		size := 22
-		gap := 6
+		sx := px + int(8*scale)
+		sy := py + int(20*scale)
+		size := int(22 * scale)
+		if size < 22 {
+			size = 22
+		}
+		gap := int(6 * scale)
+		if gap < 6 {
+			gap = 6
+		}
 		for i, c := range a.colorPalette {
 			cx := sx + (i%cols)*(size+gap)
 			cy := sy + (i/cols)*(size+gap)
@@ -2237,7 +2709,11 @@ func (a *App) uiFace(size int, bold, italic bool, family sqdoc.FontFamily) font.
 	if base == nil {
 		return basicfont.Face7x13
 	}
-	opts := &opentype.FaceOptions{Size: float64(size) * float64(a.uiScales[a.uiScaleIdx]), DPI: 72, Hinting: font.HintingFull}
+	scaledSize := math.Round(float64(size) * float64(a.uiScales[a.uiScaleIdx]))
+	if scaledSize < 8 {
+		scaledSize = 8
+	}
+	opts := &opentype.FaceOptions{Size: scaledSize, DPI: 72, Hinting: font.HintingFull}
 	face, err := opentype.NewFace(base, opts)
 	if err != nil {
 		return basicfont.Face7x13
@@ -2289,17 +2765,19 @@ func (a *App) layoutDocumentLines() {
 			for {
 				lineEnd := logicalEnd
 				if a.pagedMode && wrapStart < logicalEnd {
-					lineEnd = a.wrapSegmentEnd(textBytes, runs, wrapStart, logicalEnd, wrapWidth)
+					lineEnd = a.wrapSegmentEnd(bi, textBytes, runs, wrapStart, logicalEnd, wrapWidth)
 				}
 				if lineEnd <= wrapStart && wrapStart < logicalEnd {
 					lineEnd = nextRuneBoundary(textBytes, wrapStart)
 				}
 				lineBytes := append([]byte(nil), textBytes[wrapStart:lineEnd]...)
 				lineLen := len(lineBytes)
+				imageTokens := parseInlineImageTokens(lineBytes)
 				segments := make([]lineSegment, 0, len(runs))
 				lineWidth := 0
 				maxAscent := 0
 				maxDescent := 0
+				addedImages := map[int]bool{}
 
 				for _, run := range runs {
 					rs := int(run.Start)
@@ -2314,27 +2792,85 @@ func (a *App) layoutDocumentLines() {
 					}
 					attr := normalizeStyleAttr(run.Attr, a.preferredFontFamily)
 					face := a.uiFace(int(attr.FontSizePt), attr.Bold, attr.Italic, attr.FontFamily)
-					segText := ""
-					if segStart < segEnd && segEnd <= lineLen {
-						segText = string(lineBytes[segStart:segEnd])
+					cursor := segStart
+					for cursor < segEnd {
+						token := imageTokenAt(imageTokens, cursor, segEnd)
+						if token == nil {
+							if cursor < segEnd && segEnd <= lineLen {
+								segText := string(lineBytes[cursor:segEnd])
+								segW := a.measureString(face, segText)
+								m := face.Metrics()
+								if asc := m.Ascent.Round(); asc > maxAscent {
+									maxAscent = asc
+								}
+								if des := m.Descent.Round(); des > maxDescent {
+									maxDescent = des
+								}
+								segments = append(segments, lineSegment{
+									start: cursor,
+									end:   segEnd,
+									text:  segText,
+									attr:  attr,
+									face:  face,
+									width: segW,
+								})
+								lineWidth += segW
+							}
+							break
+						}
+						if token.start > cursor {
+							textEnd := min(token.start, segEnd)
+							if cursor < textEnd && textEnd <= lineLen {
+								segText := string(lineBytes[cursor:textEnd])
+								segW := a.measureString(face, segText)
+								m := face.Metrics()
+								if asc := m.Ascent.Round(); asc > maxAscent {
+									maxAscent = asc
+								}
+								if des := m.Descent.Round(); des > maxDescent {
+									maxDescent = des
+								}
+								segments = append(segments, lineSegment{
+									start: cursor,
+									end:   textEnd,
+									text:  segText,
+									attr:  attr,
+									face:  face,
+									width: segW,
+								})
+								lineWidth += segW
+							}
+							cursor = textEnd
+							continue
+						}
+						// Cursor is inside/at token range.
+						if !addedImages[token.start] && segEnd >= token.end {
+							imageW, imageH := a.tokenDisplaySize(bi, *token, int(attr.FontSizePt), wrapStart+token.start)
+							segments = append(segments, lineSegment{
+								start:     token.start,
+								end:       token.end,
+								attr:      attr,
+								face:      face,
+								width:     imageW,
+								isImage:   true,
+								imagePath: token.path,
+								imageW:    imageW,
+								imageH:    imageH,
+							})
+							lineWidth += imageW
+							if imageH > maxAscent {
+								maxAscent = imageH
+							}
+							if maxDescent < 2 {
+								maxDescent = 2
+							}
+							addedImages[token.start] = true
+						}
+						cursor = min(segEnd, token.end)
+						if cursor <= token.start {
+							cursor = token.start + 1
+						}
 					}
-					segW := a.measureString(face, segText)
-					m := face.Metrics()
-					if asc := m.Ascent.Round(); asc > maxAscent {
-						maxAscent = asc
-					}
-					if des := m.Descent.Round(); des > maxDescent {
-						maxDescent = des
-					}
-					segments = append(segments, lineSegment{
-						start: segStart,
-						end:   segEnd,
-						text:  segText,
-						attr:  attr,
-						face:  face,
-						width: segW,
-					})
-					lineWidth += segW
 				}
 
 				if len(segments) == 0 {
@@ -2428,14 +2964,47 @@ func normalizeStyleAttr(attr sqdoc.StyleAttr, fallbackFamily sqdoc.FontFamily) s
 	return attr
 }
 
-func (a *App) wrapSegmentEnd(text []byte, runs []sqdoc.StyleRun, start, lineEnd, maxWidth int) int {
+func (a *App) wrapSegmentEnd(block int, text []byte, runs []sqdoc.StyleRun, start, lineEnd, maxWidth int) int {
 	if start >= lineEnd || maxWidth <= 0 {
 		return lineEnd
 	}
+	relStart := start
+	if relStart < 0 {
+		relStart = 0
+	}
+	if relStart > len(text) {
+		relStart = len(text)
+	}
+	relEnd := lineEnd
+	if relEnd < relStart {
+		relEnd = relStart
+	}
+	if relEnd > len(text) {
+		relEnd = len(text)
+	}
+	lineTokens := parseInlineImageTokens(text[relStart:relEnd])
+	for i := range lineTokens {
+		lineTokens[i].start += relStart
+		lineTokens[i].end += relStart
+	}
+
 	width := 0
 	lastBreak := -1
 	pos := start
 	for pos < lineEnd {
+		if tok := imageTokenAt(lineTokens, pos, lineEnd); tok != nil && tok.start == pos {
+			attr := normalizeStyleAttr(styleAttrAtOffset(runs, pos), a.preferredFontFamily)
+			imageW, _ := a.tokenDisplaySize(block, *tok, int(attr.FontSizePt), tok.start)
+			if width+imageW > maxWidth && pos > start {
+				if lastBreak > start {
+					return lastBreak
+				}
+				return pos
+			}
+			width += imageW
+			pos = tok.end
+			continue
+		}
 		r, size := utf8.DecodeRune(text[pos:lineEnd])
 		if size <= 0 {
 			size = 1
@@ -2487,7 +3056,7 @@ func (a *App) drawDocumentText(screen *ebiten.Image) {
 		baseline := ll.baseline - a.contentRect.y
 		for _, seg := range ll.segments {
 			segX := x
-			if seg.attr.Highlight && seg.width > 0 {
+			if seg.attr.Highlight && seg.width > 0 && !seg.isImage {
 				top := baseline - seg.face.Metrics().Ascent.Round()
 				h := seg.face.Metrics().Ascent.Round() + seg.face.Metrics().Descent.Round()
 				if h < 12 {
@@ -2495,7 +3064,25 @@ func (a *App) drawDocumentText(screen *ebiten.Image) {
 				}
 				a.drawFilledRectOnScreen(a.docLayer, segX, top, seg.width, h, highlightColor)
 			}
-			if seg.text != "" {
+			if seg.isImage {
+				imgTop := baseline - seg.imageH
+				if cached := a.inlineImage(seg.imagePath); cached.img != nil && cached.err == nil {
+					op := &ebiten.DrawImageOptions{}
+					if cached.w > 0 && cached.h > 0 {
+						op.GeoM.Scale(float64(seg.imageW)/float64(cached.w), float64(seg.imageH)/float64(cached.h))
+					}
+					op.GeoM.Translate(float64(segX), float64(imgTop))
+					a.docLayer.DrawImage(cached.img, op)
+				} else {
+					placeholder := color.RGBA{R: 238, G: 241, B: 248, A: 255}
+					border := color.RGBA{R: 151, G: 165, B: 188, A: 255}
+					a.drawFilledRectOnScreen(a.docLayer, segX, imgTop, seg.imageW, seg.imageH, placeholder)
+					ebitenutil.DrawLine(a.docLayer, float64(segX), float64(imgTop), float64(segX+seg.imageW), float64(imgTop), border)
+					ebitenutil.DrawLine(a.docLayer, float64(segX), float64(imgTop+seg.imageH), float64(segX+seg.imageW), float64(imgTop+seg.imageH), border)
+					ebitenutil.DrawLine(a.docLayer, float64(segX), float64(imgTop), float64(segX), float64(imgTop+seg.imageH), border)
+					ebitenutil.DrawLine(a.docLayer, float64(segX+seg.imageW), float64(imgTop), float64(segX+seg.imageW), float64(imgTop+seg.imageH), border)
+				}
+			} else if seg.text != "" {
 				clr := rgbaFromUint32(seg.attr.ColorRGBA)
 				text.Draw(a.docLayer, seg.text, seg.face, segX, baseline, clr)
 				if seg.attr.Underline {
@@ -2751,8 +3338,12 @@ func (a *App) lineAdvance(line lineLayout, relByte int) int {
 		if relByte <= seg.start {
 			break
 		}
-		part := string(line.text[seg.start:relByte])
-		advance += a.measureString(seg.face, part)
+		if seg.isImage {
+			advance += seg.width
+		} else {
+			part := string(line.text[seg.start:relByte])
+			advance += a.measureString(seg.face, part)
+		}
 		break
 	}
 	return advance
@@ -2767,6 +3358,12 @@ func (a *App) byteAtX(line lineLayout, relX int) int {
 		if relX > x+seg.width {
 			x += seg.width
 			continue
+		}
+		if seg.isImage {
+			if relX < x+seg.width/2 {
+				return seg.start
+			}
+			return seg.end
 		}
 		bytesSeg := line.text[seg.start:seg.end]
 		pos := seg.start
@@ -2900,6 +3497,267 @@ func (a *App) redo() {
 	a.state = editor.NewState(last.doc)
 	a.state.CurrentBlock = last.currentBlock
 	a.state.CaretByte = last.caretByte
+}
+
+func (a *App) insertImageFromFileDialog() error {
+	path, err := dialog.File().Filter("Image files", "png", "jpg", "jpeg", "gif", "bmp", "webp").Load()
+	if err != nil {
+		return err
+	}
+	return a.insertImageAtCaret(path)
+}
+
+func (a *App) insertImageFromClipboard() error {
+	inserted, err := a.tryInsertImageFromClipboard()
+	if err != nil {
+		return err
+	}
+	if !inserted {
+		return errors.New("clipboard does not contain image data")
+	}
+	return nil
+}
+
+func (a *App) insertImageAtCaret(path string) error {
+	path = normalizeImagePath(path)
+	if path == "" {
+		return errors.New("no image selected")
+	}
+	if !isSupportedImagePath(path) {
+		return errors.New("unsupported image type")
+	}
+	if _, err := os.Stat(path); err != nil {
+		return err
+	}
+	a.snapCaretOutOfInlineImage(0)
+	a.selectedImageValid = false
+	a.pushUndoSnapshot()
+	if err := a.state.InsertTextAtCaret(makeInlineImageToken(path)); err != nil {
+		return err
+	}
+	a.status = "Inserted image: " + filepath.Base(path)
+	return nil
+}
+
+func (a *App) ensureImageClipboard() bool {
+	if a.imageClipboardInitDone {
+		return a.imageClipboardReady
+	}
+	a.imageClipboardInitDone = true
+	if err := imgclipboard.Init(); err != nil {
+		a.imageClipboardReady = false
+		return false
+	}
+	a.imageClipboardReady = true
+	return true
+}
+
+func (a *App) tryInsertImageFromClipboard() (bool, error) {
+	// First, prefer a valid file path from textual clipboard content.
+	if raw, err := textclipboard.ReadAll(); err == nil && strings.TrimSpace(raw) != "" {
+		if path := extractImagePathFromClipboard(raw); path != "" {
+			return true, a.insertImageAtCaret(path)
+		}
+	}
+	if !a.ensureImageClipboard() {
+		return false, nil
+	}
+	pngBytes := imgclipboard.Read(imgclipboard.FmtImage)
+	if len(pngBytes) == 0 {
+		return false, nil
+	}
+	return true, a.insertImageBytesAtCaret(pngBytes, "clipboard")
+}
+
+func (a *App) insertImageBytesAtCaret(data []byte, nameHint string) error {
+	if len(data) == 0 {
+		return errors.New("empty image data")
+	}
+	path, err := a.persistImageBytes(data, nameHint)
+	if err != nil {
+		return err
+	}
+	a.snapCaretOutOfInlineImage(0)
+	a.selectedImageValid = false
+	a.pushUndoSnapshot()
+	if err := a.state.InsertTextAtCaret(makeInlineImageToken(path)); err != nil {
+		return err
+	}
+	a.status = "Inserted image: " + filepath.Base(path)
+	return nil
+}
+
+func (a *App) persistImageBytes(data []byte, nameHint string) (string, error) {
+	imgDecoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	dir := a.managedImageDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	stem := sanitizeFileStem(strings.TrimSuffix(filepath.Base(nameHint), filepath.Ext(nameHint)))
+	if stem == "" {
+		stem = "image"
+	}
+	name := fmt.Sprintf("%s_%d.png", stem, time.Now().UnixNano())
+	path := filepath.Join(dir, name)
+	f, err := os.Create(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if err := png.Encode(f, imgDecoded); err != nil {
+		return "", err
+	}
+	return filepath.Clean(path), nil
+}
+
+func (a *App) managedImageDir() string {
+	base, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(base) == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "SIDE", "images")
+}
+
+func sanitizeFileStem(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	lastUnderscore := false
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' {
+			b.WriteRune(r)
+			lastUnderscore = false
+			continue
+		}
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "image"
+	}
+	return out
+}
+
+func (a *App) handleDroppedImages() {
+	if a.state == nil {
+		return
+	}
+	// Ignore file drops while modal overlays are open.
+	if a.showPasswordPrompt || a.showTabChooser || a.showEncryption || a.showHelp {
+		return
+	}
+	dropped := ebiten.DroppedFiles()
+	if dropped == nil {
+		a.dropBatchActive = false
+		return
+	}
+	rootEntries, err := iofs.ReadDir(dropped, ".")
+	if err != nil || len(rootEntries) == 0 {
+		a.dropBatchActive = false
+		return
+	}
+	if a.dropBatchActive {
+		return
+	}
+	a.dropBatchActive = true
+
+	dropX, dropY := ebiten.CursorPosition()
+	if !a.contentRect.contains(dropX, dropY) {
+		a.status = "Drop ignored: drop images inside the document area"
+		return
+	}
+	block, bytePos := a.hitTestPosition(dropX, dropY)
+	a.state.SetCaret(block, bytePos)
+	a.state.ClearSelection()
+	a.snapCaretOutOfInlineImage(0)
+	a.selectedImageValid = false
+
+	inserted := 0
+	skipped := 0
+	var firstErr error
+	didSnapshot := false
+
+	walkErr := iofs.WalkDir(dropped, ".", func(path string, d iofs.DirEntry, err error) error {
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		if d == nil || d.IsDir() {
+			return nil
+		}
+		if !isSupportedImagePath(path) {
+			skipped++
+			return nil
+		}
+		f, err := dropped.Open(path)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		data, readErr := io.ReadAll(f)
+		_ = f.Close()
+		if readErr != nil {
+			if firstErr == nil {
+				firstErr = readErr
+			}
+			return nil
+		}
+		if len(data) == 0 {
+			skipped++
+			return nil
+		}
+		storedPath, persistErr := a.persistImageBytes(data, filepath.Base(path))
+		if persistErr != nil {
+			if firstErr == nil {
+				firstErr = persistErr
+			}
+			return nil
+		}
+		if !didSnapshot {
+			a.pushUndoSnapshot()
+			didSnapshot = true
+		}
+		if inserted > 0 {
+			_ = a.state.InsertTextAtCaret("\n")
+		}
+		if err := a.state.InsertTextAtCaret(makeInlineImageToken(storedPath)); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return nil
+		}
+		inserted++
+		return nil
+	})
+	if walkErr != nil && firstErr == nil {
+		firstErr = walkErr
+	}
+
+	switch {
+	case inserted > 0:
+		if inserted == 1 {
+			a.status = "Inserted dropped image"
+		} else {
+			a.status = fmt.Sprintf("Inserted %d dropped images", inserted)
+		}
+	case firstErr != nil:
+		a.status = "Drop failed: " + firstErr.Error()
+	case skipped > 0:
+		a.status = "Drop ignored: no supported image files"
+	}
 }
 
 func (a *App) openDocumentDialog() error {
@@ -3042,6 +3900,9 @@ func (a *App) drawHelpOverlay(screen *ebiten.Image, face font.Face) {
 		"Ctrl+S: Save | Ctrl+Shift+S: Save As",
 		"Ctrl+O: Open | Ctrl+N: New | Ctrl+T: New Tab",
 		"Ctrl+Tab / Ctrl+Shift+Tab: Switch tabs",
+		"Insert > Image to embed inline images",
+		"Ctrl+V: Paste text or image from clipboard",
+		"Drag image files from Explorer/Finder into document",
 		"Ctrl+Z: Undo | Ctrl+Y: Redo",
 		"Ctrl+B/I/U: Bold / Italic / Underline",
 		"Ctrl+Shift+H: Toggle text highlight",
@@ -3083,6 +3944,552 @@ func (a *App) fillRectWithinContent(x, y, w, h int, c color.RGBA) {
 	a.frameBuffer.FillRect(x, y, w, h, c)
 }
 
+func (a *App) imageAtPoint(x, y int) (imageHit, bool) {
+	for _, ll := range a.lineLayouts {
+		if y < ll.y || y > ll.y+ll.height {
+			continue
+		}
+		segX := ll.viewX
+		for _, seg := range ll.segments {
+			if seg.isImage {
+				top := ll.baseline - seg.imageH
+				r := rect{x: segX, y: top, w: seg.imageW, h: seg.imageH}
+				if r.contains(x, y) {
+					return imageHit{
+						block: ll.block,
+						start: ll.startByte + seg.start,
+						end:   ll.startByte + seg.end,
+						path:  seg.imagePath,
+						w:     seg.imageW,
+						h:     seg.imageH,
+						r:     r,
+					}, true
+				}
+			}
+			segX += seg.width
+		}
+	}
+	return imageHit{}, false
+}
+
+func (a *App) selectedImageOnScreen() (imageHit, bool) {
+	if !a.selectedImageValid {
+		return imageHit{}, false
+	}
+	target := a.selectedImage
+	for _, ll := range a.lineLayouts {
+		if ll.block != target.block {
+			continue
+		}
+		segX := ll.viewX
+		for _, seg := range ll.segments {
+			if !seg.isImage {
+				segX += seg.width
+				continue
+			}
+			absStart := ll.startByte + seg.start
+			absEnd := ll.startByte + seg.end
+			if absStart == target.start && absEnd == target.end {
+				top := ll.baseline - seg.imageH
+				target.r = rect{x: segX, y: top, w: seg.imageW, h: seg.imageH}
+				target.w = seg.imageW
+				target.h = seg.imageH
+				return target, true
+			}
+			segX += seg.width
+		}
+	}
+	return imageHit{}, false
+}
+
+func (a *App) imageResizeHandleRect(r rect) rect {
+	size := int(10 * a.uiScales[a.uiScaleIdx])
+	if size < 10 {
+		size = 10
+	}
+	return rect{x: r.x + r.w - size - 2, y: r.y + r.h - size - 2, w: size, h: size}
+}
+
+func (a *App) drawImageInteractionOverlay(screen *ebiten.Image) {
+	if hit, ok := a.selectedImageOnScreen(); ok {
+		a.selectedImage = hit
+		if !a.dragImageActive && !a.resizeImageActive {
+			border := color.RGBA{R: 57, G: 104, B: 176, A: 255}
+			ebitenutil.DrawLine(screen, float64(hit.r.x), float64(hit.r.y), float64(hit.r.x+hit.r.w), float64(hit.r.y), border)
+			ebitenutil.DrawLine(screen, float64(hit.r.x), float64(hit.r.y+hit.r.h), float64(hit.r.x+hit.r.w), float64(hit.r.y+hit.r.h), border)
+			ebitenutil.DrawLine(screen, float64(hit.r.x), float64(hit.r.y), float64(hit.r.x), float64(hit.r.y+hit.r.h), border)
+			ebitenutil.DrawLine(screen, float64(hit.r.x+hit.r.w), float64(hit.r.y), float64(hit.r.x+hit.r.w), float64(hit.r.y+hit.r.h), border)
+
+			handle := a.imageResizeHandleRect(hit.r)
+			a.drawFilledRectOnScreen(screen, handle.x, handle.y, handle.w, handle.h, border)
+		}
+	}
+	if a.resizeImageActive && a.selectedImageValid {
+		if hit, ok := a.selectedImageOnScreen(); ok {
+			previewW := max(24, a.resizePreviewW)
+			previewH := max(20, a.resizePreviewH)
+			if cached := a.inlineImage(hit.path); cached.img != nil && cached.err == nil {
+				op := &ebiten.DrawImageOptions{}
+				if cached.w > 0 && cached.h > 0 {
+					op.GeoM.Scale(float64(previewW)/float64(cached.w), float64(previewH)/float64(cached.h))
+				}
+				op.GeoM.Translate(float64(hit.r.x), float64(hit.r.y))
+				op.ColorScale.ScaleAlpha(0.72)
+				screen.DrawImage(cached.img, op)
+			} else {
+				a.drawFilledRectOnScreen(screen, hit.r.x, hit.r.y, previewW, previewH, color.RGBA{R: 233, G: 239, B: 247, A: 220})
+			}
+			border := color.RGBA{R: 57, G: 104, B: 176, A: 255}
+			ebitenutil.DrawLine(screen, float64(hit.r.x), float64(hit.r.y), float64(hit.r.x+previewW), float64(hit.r.y), border)
+			ebitenutil.DrawLine(screen, float64(hit.r.x), float64(hit.r.y+previewH), float64(hit.r.x+previewW), float64(hit.r.y+previewH), border)
+			ebitenutil.DrawLine(screen, float64(hit.r.x), float64(hit.r.y), float64(hit.r.x), float64(hit.r.y+previewH), border)
+			ebitenutil.DrawLine(screen, float64(hit.r.x+previewW), float64(hit.r.y), float64(hit.r.x+previewW), float64(hit.r.y+previewH), border)
+		}
+	}
+	if a.dragImageActive && a.selectedImageValid {
+		if x, y, h, ok := a.caretVisualPosition(a.dragImageDropBlock, a.dragImageDropByte); ok {
+			ins := color.RGBA{R: 33, G: 96, B: 186, A: 255}
+			ebitenutil.DrawLine(screen, float64(x), float64(y), float64(x), float64(y+h), ins)
+		}
+		cx, cy := ebiten.CursorPosition()
+		px := cx - a.dragImageOffsetX
+		py := cy - a.dragImageOffsetY
+		preview := a.selectedImage
+		if cached := a.inlineImage(preview.path); cached.img != nil && cached.err == nil {
+			op := &ebiten.DrawImageOptions{}
+			if cached.w > 0 && cached.h > 0 {
+				op.GeoM.Scale(float64(preview.w)/float64(cached.w), float64(preview.h)/float64(cached.h))
+			}
+			op.GeoM.Translate(float64(px), float64(py))
+			op.ColorScale.ScaleAlpha(0.75)
+			screen.DrawImage(cached.img, op)
+		}
+	}
+}
+
+func (a *App) caretVisualPosition(block, bytePos int) (int, int, int, bool) {
+	for _, ll := range a.lineLayouts {
+		if ll.block != block {
+			continue
+		}
+		lineStart := ll.startByte
+		lineEnd := ll.startByte + len(ll.text)
+		if bytePos < lineStart || bytePos > lineEnd {
+			continue
+		}
+		x := ll.viewX + a.lineAdvance(ll, bytePos-lineStart)
+		return x, ll.y + 1, max(2, ll.height-2), true
+	}
+	return 0, 0, 0, false
+}
+
+func (a *App) blockInlineImageTokens(block int) []inlineImageToken {
+	if a.state == nil || block < 0 || block >= a.state.BlockCount() {
+		return nil
+	}
+	allTexts := a.state.AllBlockTexts()
+	if block >= len(allTexts) {
+		return nil
+	}
+	return parseInlineImageTokens([]byte(allTexts[block]))
+}
+
+func (a *App) snapCaretOutOfInlineImage(direction int) bool {
+	if a.state == nil || a.state.HasSelection() {
+		return false
+	}
+	block := a.state.CurrentBlock
+	caret := a.state.CaretByte
+	for _, tok := range a.blockInlineImageTokens(block) {
+		if caret <= tok.start || caret >= tok.end {
+			continue
+		}
+		target := tok.end
+		switch {
+		case direction < 0:
+			target = tok.start
+		case direction > 0:
+			target = tok.end
+		default:
+			if caret-tok.start <= tok.end-caret {
+				target = tok.start
+			}
+		}
+		a.state.SetCaret(block, target)
+		return true
+	}
+	return false
+}
+
+func (a *App) selectedImageTokenValid() bool {
+	if !a.selectedImageValid || a.state == nil {
+		return false
+	}
+	img := a.selectedImage
+	wantPath := normalizeImagePath(img.path)
+	for _, tok := range a.blockInlineImageTokens(img.block) {
+		if tok.start != img.start || tok.end != img.end {
+			continue
+		}
+		if wantPath == "" || wantPath == normalizeImagePath(tok.path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) replaceBlockRangeText(block, start, end int, replacement string) error {
+	if a.state == nil {
+		return errors.New("editor state unavailable")
+	}
+	if block < 0 || block >= a.state.BlockCount() {
+		return errors.New("invalid block index")
+	}
+	if start > end {
+		start, end = end, start
+	}
+	a.state.SetCaret(block, start)
+	a.state.EnsureSelectionAnchor()
+	a.state.SetCaret(block, end)
+	a.state.UpdateSelectionFromCaret()
+	_ = a.state.DeleteSelection()
+	if replacement != "" {
+		if err := a.state.InsertTextAtCaret(replacement); err != nil {
+			return err
+		}
+	}
+	a.state.ClearSelection()
+	return nil
+}
+
+func (a *App) updateSelectedImageTokenSize(width, height int) error {
+	if !a.selectedImageValid {
+		return errors.New("no image selected")
+	}
+	if !a.selectedImageTokenValid() {
+		a.selectedImageValid = false
+		return errors.New("selected image is stale")
+	}
+	img := a.selectedImage
+	token := makeInlineImageTokenSized(img.path, width, height)
+	if err := a.replaceBlockRangeText(img.block, img.start, img.end, token); err != nil {
+		return err
+	}
+	img.end = img.start + len(token)
+	img.w = width
+	img.h = height
+	a.selectedImage = img
+	a.state.SetCaret(img.block, img.end)
+	return nil
+}
+
+func (a *App) moveSelectedImageToken(dstBlock, dstByte int) error {
+	if !a.selectedImageValid {
+		return errors.New("no image selected")
+	}
+	if !a.selectedImageTokenValid() {
+		a.selectedImageValid = false
+		return errors.New("selected image is stale")
+	}
+	img := a.selectedImage
+	if dstBlock == img.block && dstByte >= img.start && dstByte <= img.end {
+		return nil
+	}
+	token := makeInlineImageTokenSized(img.path, img.w, img.h)
+	if err := a.replaceBlockRangeText(img.block, img.start, img.end, ""); err != nil {
+		return err
+	}
+	if dstBlock == img.block && dstByte > img.end {
+		dstByte -= (img.end - img.start)
+	}
+	if err := a.replaceBlockRangeText(dstBlock, dstByte, dstByte, token); err != nil {
+		return err
+	}
+	a.selectedImage = imageHit{
+		block: dstBlock,
+		start: dstByte,
+		end:   dstByte + len(token),
+		path:  img.path,
+		w:     img.w,
+		h:     img.h,
+	}
+	a.selectedImageValid = true
+	a.state.SetCaret(dstBlock, dstByte+len(token))
+	return nil
+}
+
+func (a *App) deleteSelectedOrAdjacentImage(backward bool) bool {
+	if a.selectedImageValid && !a.selectedImageTokenValid() {
+		a.selectedImageValid = false
+	}
+	if a.selectedImageValid {
+		img := a.selectedImage
+		if a.replaceBlockRangeText(img.block, img.start, img.end, "") == nil {
+			a.selectedImageValid = false
+			a.state.SetCaret(img.block, img.start)
+			return true
+		}
+	}
+	if tok, ok := a.imageTokenNearCaret(backward); ok {
+		if a.replaceBlockRangeText(a.state.CurrentBlock, tok.start, tok.end, "") == nil {
+			a.state.SetCaret(a.state.CurrentBlock, tok.start)
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) imageTokenNearCaret(backward bool) (inlineImageToken, bool) {
+	if a.state == nil || a.state.CurrentBlock < 0 || a.state.CurrentBlock >= a.state.BlockCount() {
+		return inlineImageToken{}, false
+	}
+	blockText := a.state.CurrentBlockText()
+	tokens := parseInlineImageTokens(blockText)
+	caret := a.state.CaretByte
+	for _, tok := range tokens {
+		if backward {
+			if caret == tok.end || (tok.start < caret && caret <= tok.end) {
+				return tok, true
+			}
+		} else {
+			if caret == tok.start || (tok.start <= caret && caret < tok.end) {
+				return tok, true
+			}
+		}
+	}
+	return inlineImageToken{}, false
+}
+
+func (a *App) clearImageInteraction() {
+	a.selectedImageValid = false
+	a.dragImagePending = false
+	a.dragImageActive = false
+	a.resizeImageActive = false
+}
+
+const (
+	inlineImageTokenPrefix = "[[imgb64:"
+	inlineImageTokenSuffix = "]]"
+)
+
+type inlineImagePayload struct {
+	Path string `json:"p"`
+	W    int    `json:"w,omitempty"`
+	H    int    `json:"h,omitempty"`
+}
+
+func makeInlineImageToken(path string) string {
+	return makeInlineImageTokenSized(path, 0, 0)
+}
+
+func makeInlineImageTokenSized(path string, w, h int) string {
+	payload := inlineImagePayload{
+		Path: normalizeImagePath(path),
+		W:    max(0, w),
+		H:    max(0, h),
+	}
+	blob, err := json.Marshal(payload)
+	if err != nil {
+		blob = []byte(payload.Path)
+	}
+	enc := base64.RawURLEncoding.EncodeToString(blob)
+	return inlineImageTokenPrefix + enc + inlineImageTokenSuffix
+}
+
+func parseInlineImageTokens(line []byte) []inlineImageToken {
+	if len(line) == 0 {
+		return nil
+	}
+	s := string(line)
+	out := make([]inlineImageToken, 0, 2)
+	pos := 0
+	for pos < len(s) {
+		start := strings.Index(s[pos:], inlineImageTokenPrefix)
+		if start < 0 {
+			break
+		}
+		start += pos
+		payloadStart := start + len(inlineImageTokenPrefix)
+		endRel := strings.Index(s[payloadStart:], inlineImageTokenSuffix)
+		if endRel < 0 {
+			break
+		}
+		payloadEnd := payloadStart + endRel
+		end := payloadEnd + len(inlineImageTokenSuffix)
+		decoded, err := base64.RawURLEncoding.DecodeString(s[payloadStart:payloadEnd])
+		if err == nil {
+			path := ""
+			w := 0
+			h := 0
+			var payload inlineImagePayload
+			if json.Unmarshal(decoded, &payload) == nil && strings.TrimSpace(payload.Path) != "" {
+				path = normalizeImagePath(payload.Path)
+				w = max(0, payload.W)
+				h = max(0, payload.H)
+			} else {
+				path = normalizeImagePath(string(decoded))
+			}
+			if path != "" {
+				out = append(out, inlineImageToken{start: start, end: end, path: path, w: w, h: h})
+			}
+		}
+		pos = end
+	}
+	return out
+}
+
+func imageTokenAt(tokens []inlineImageToken, cursor, segEnd int) *inlineImageToken {
+	for i := range tokens {
+		tok := &tokens[i]
+		if tok.end <= cursor {
+			continue
+		}
+		if tok.start >= segEnd {
+			continue
+		}
+		return tok
+	}
+	return nil
+}
+
+func (a *App) inlineImage(path string) cachedInlineImage {
+	path = normalizeImagePath(path)
+	if path == "" {
+		return cachedInlineImage{err: errors.New("empty image path")}
+	}
+	if cached, ok := a.imageCache[path]; ok {
+		return cached
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		cached := cachedInlineImage{err: err}
+		a.imageCache[path] = cached
+		return cached
+	}
+	imgDecoded, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		cached := cachedInlineImage{err: err}
+		a.imageCache[path] = cached
+		return cached
+	}
+	b := imgDecoded.Bounds()
+	cached := cachedInlineImage{
+		img: ebiten.NewImageFromImage(imgDecoded),
+		w:   b.Dx(),
+		h:   b.Dy(),
+	}
+	a.imageCache[path] = cached
+	return cached
+}
+
+func (a *App) inlineImageSize(path string, fontSize int, requestedW, requestedH int) (int, int) {
+	if fontSize <= 0 {
+		fontSize = 14
+	}
+	targetH := int(float64(fontSize) * 2.1 * float64(a.uiScales[a.uiScaleIdx]))
+	if targetH < 26 {
+		targetH = 26
+	}
+	if targetH > 400 {
+		targetH = 400
+	}
+	cached := a.inlineImage(path)
+	if cached.img == nil || cached.w <= 0 || cached.h <= 0 {
+		w := requestedW
+		h := requestedH
+		if w <= 0 && h <= 0 {
+			w = int(float64(targetH) * 1.4)
+			h = targetH
+		} else if w > 0 && h <= 0 {
+			h = targetH
+		} else if h > 0 && w <= 0 {
+			w = int(float64(h) * 1.4)
+		}
+		return max(24, w), max(20, h)
+	}
+	if requestedW > 0 || requestedH > 0 {
+		if requestedW > 0 && requestedH > 0 {
+			return requestedW, requestedH
+		}
+		if requestedW > 0 {
+			h := int(float64(cached.h) * (float64(requestedW) / float64(cached.w)))
+			return requestedW, max(20, h)
+		}
+		w := int(float64(cached.w) * (float64(requestedH) / float64(cached.h)))
+		return max(24, w), requestedH
+	}
+	w := int(float64(cached.w) * (float64(targetH) / float64(cached.h)))
+	maxW := max(60, a.contentRect.w-28)
+	if w > maxW {
+		w = maxW
+		targetH = int(float64(cached.h) * (float64(w) / float64(cached.w)))
+		if targetH < 24 {
+			targetH = 24
+		}
+	}
+	return w, targetH
+}
+
+func (a *App) tokenDisplaySize(block int, token inlineImageToken, fontSize int, absStart int) (int, int) {
+	if a.resizeImageActive && a.selectedImageValid &&
+		block == a.selectedImage.block &&
+		absStart == a.selectedImage.start {
+		return max(24, a.resizePreviewW), max(20, a.resizePreviewH)
+	}
+	return a.inlineImageSize(token.path, fontSize, token.w, token.h)
+}
+
+func extractImagePathFromClipboard(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	for _, line := range strings.Split(raw, "\n") {
+		candidate := normalizeImagePath(line)
+		if candidate == "" {
+			continue
+		}
+		if !isSupportedImagePath(candidate) {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func normalizeImagePath(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, "\"")
+	s = strings.Trim(s, "'")
+	if s == "" {
+		return ""
+	}
+	lower := strings.ToLower(s)
+	if strings.HasPrefix(lower, "file://") {
+		u, err := url.Parse(s)
+		if err == nil {
+			p, _ := url.PathUnescape(u.Path)
+			if runtime.GOOS == "windows" && strings.HasPrefix(p, "/") && len(p) > 2 && p[2] == ':' {
+				p = p[1:]
+			}
+			s = p
+		}
+	}
+	return filepath.Clean(s)
+}
+
+func isSupportedImagePath(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp":
+		return true
+	default:
+		return false
+	}
+}
+
 func defaultAttr() sqdoc.StyleAttr {
 	return sqdoc.StyleAttr{FontSizePt: 14, ColorRGBA: 0x202020FF, FontFamily: sqdoc.FontFamilySans}
 }
@@ -3103,6 +4510,13 @@ func nextRuneBoundary(text []byte, pos int) int {
 		size = 1
 	}
 	return pos + size
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
 
 func isFontFamilySupported(f sqdoc.FontFamily) bool {
